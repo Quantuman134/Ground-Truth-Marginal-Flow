@@ -153,6 +153,13 @@ class Config:
                               f"'one_sided' or 'central'")
         if self.get("ode.integrator") not in ("rk4", "euler"):
             raise ConfigError(f"{self._where()}: ode.integrator must be 'rk4' or 'euler'")
+        # Optional with a default, unlike the keys above, so it is checked only
+        # for a bad VALUE -- but checked here rather than at first use, so a typo
+        # stops the run before 1.3 GB of centres is read.
+        if self.get("monte_carlo.rho_source", default="exact") not in ("exact",
+                                                                      "empirical"):
+            raise ConfigError(f"{self._where()}: monte_carlo.rho_source must be "
+                              f"'exact' or 'empirical'")
         if self.get("data.source", default="latents") not in ("latents", "synthetic"):
             raise ConfigError(f"{self._where()}: data.source must be 'latents' or "
                               f"'synthetic'")

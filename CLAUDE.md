@@ -183,17 +183,29 @@ sigma=0.01 is the stiffest case near t->1 and needs the most rk4 steps.
 
 ## Environment and Execution
 
-Conda env `SiT`, torch 2.11.0+cu128. Available: numpy 2.4.3, pyyaml, tqdm,
-matplotlib, scipy, torchdiffeq 0.2.5 (unused by choice).
+Conda env `SiT` everywhere. On the **current development machine**:
 
 ```bash
-source /scratch/project/prj-02-visual-ai/hkzhang/miniconda3/etc/profile.d/conda.sh
+source /home/hkzhang/anaconda3/etc/profile.d/conda.sh
 conda activate SiT
 ```
 
-All experiments run **remotely on 8x H200 (~140 GB VRAM each)** via `torchrun`.
-Claude has no GPU access from this machine — write launchers, do not run them.
-The GPU count must be settable from the config file.
+torch 2.7.1+cu118, numpy 2.4.2, scipy 1.17.1, matplotlib 3.10.8, pyyaml, tqdm,
+pytest 9.1.1, torchdiffeq 0.2.5 (unused by choice).
+
+Run the suite with `python -m pytest tests -q` (~60 s, no GPU required for most
+of it).
+
+**This machine has 4x H100 NVL (96 GB each)** and a full local copy of the
+latents, so correctness checks and benchmarks run here before anything goes to
+the cluster — do that rather than shipping unverified code.
+
+Local data root is `/home/hkzhang/ILSVRC/latents_8_mean_fp16/` (the `/scratch/...`
+paths elsewhere in this file are *cluster* paths and do not resolve here).
+
+Production runs stay **remote on 8x H200 (~140 GB VRAM each)** via `torchrun`;
+`remote_bash_script/` targets the cluster's paths, not this machine's. The GPU
+count must be settable from the config file.
 
 ## Layout
 

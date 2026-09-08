@@ -1,0 +1,971 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Reference w_avg Forward-Process Plan — Shared-σ GMM, 4×8×8 Latents</title>
+<script>
+window.MathJax={tex:{inlineMath:[['\\(','\\)']],displayMath:[['\\[','\\]']]},svg:{fontCache:'global'}};
+</script>
+<script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;line-height:1.6;color:#171717;background:#fff;margin:0}
+main{max-width:1000px;margin:auto;padding:40px 28px 72px}
+h1{font-size:30px;margin-bottom:8px}
+h2{font-size:22px;margin-top:34px;border-top:1px solid #ddd;padding-top:10px}
+h3{font-size:18px;margin-top:24px}
+.lead,.small{color:#666}
+.box,.warn,.ok{padding:14px 16px;border:1px solid #ddd;border-radius:8px;margin:16px 0}
+.box{background:#f7f7f7}.warn{background:#fff8e6}.ok{background:#eef8f0}
+pre{background:#111;color:#f4f4f4;padding:16px;border-radius:8px;overflow:auto;font-size:13px;line-height:1.45}
+table{width:100%;border-collapse:collapse;margin:16px 0;font-size:14px}
+th,td{border:1px solid #ddd;padding:9px;vertical-align:top}
+th{background:#f7f7f7}
+a{color:#1f5fbf}
+.toc a{text-decoration:none}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+</style>
+</head>
+<body><main>
+
+<h1>Plan: Compute a Reference \(w_{\mathrm{avg}}(t)\) by Forward Perturbation of a Shared-\(\sigma\) GMM Marginal Flow</h1>
+
+<p class="lead">
+Implementation specification for a coding agent. The target latent distribution is always modeled as an equally weighted Gaussian mixture model. Every component has the same isotropic standard deviation \(\sigma\). The goal is to estimate the average squared contribution of a local state perturbation at time \(t\) to the endpoint error.
+</p>
+
+<div class="ok">
+<b>Main idea.</b> Construct the reference marginal velocity \(v(x,t)\) induced by the GMM target. At a query state \(x_t\), propagate both \(x_t\) and a small perturbation \(x_t+\varepsilon u\) through the same marginal ODE. Their endpoint separation estimates the action of the state-transition operator on direction \(u\). Average over random directions and marginal query states to obtain \(w_{\mathrm{avg}}(t)\).
+</div>
+
+<div class="toc box">
+<b>Contents</b>
+<ol>
+<li><a href="#background">Background: Flow Matching and purpose of this experiment</a></li>
+<li><a href="#goal">Target quantity</a></li>
+<li><a href="#target">Shared-\(\sigma\) GMM target</a></li>
+<li><a href="#velocity">Reference marginal velocity</a></li>
+<li><a href="#queries">Sampling query states</a></li>
+<li><a href="#forward">Forward perturbation estimator</a></li>
+<li><a href="#algorithm">End-to-end algorithm</a></li>
+<li><a href="#validation">Validation</a></li>
+<li><a href="#numerics">Numerical and computational issues</a></li>
+<li><a href="#outputs">Required outputs and figures</a></li>
+<li><a href="#implementation">Implementation requirements</a></li>
+</ol>
+</div>
+
+
+<h2 id="background">0. Background: Flow Matching and purpose of this experiment</h2>
+
+<h3>0.1 Flow Matching in one paragraph</h3>
+
+<p>
+Flow Matching trains a time-dependent velocity model \(v_\theta(x,t)\) that transports a simple source distribution, typically
+\(p_0=\mathcal N(0,I)\), into a target data distribution \(p_1\). For the standard independent linear conditional path,
+</p>
+
+\[
+x_t=(1-t)x_0+t x_1,
+\qquad
+x_0\sim p_0,\quad x_1\sim p_1,
+\]
+
+<p>
+the conditional velocity is \(u=x_1-x_0\). The population-optimal Flow Matching predictor is the <b>marginal velocity</b>
+</p>
+
+\[
+v(x,t)=\mathbb E[x_1-x_0\mid x_t=x].
+\]
+
+<p>
+At generation time, samples are produced by integrating the marginal ODE
+</p>
+
+\[
+\frac{dx_t}{dt}=v(x_t,t)
+\]
+
+<p>
+from the source side to the target side. The conditional straight line is therefore a device for defining the marginal path and the training target; it is generally <b>not</b> the trajectory followed by the marginal ODE.
+</p>
+
+<h3>0.2 Why Path-Weighted Flow Matching needs this experiment</h3>
+
+<p>
+A velocity-prediction error made at one timestep does not necessarily have the same effect on the final generated sample as an equally large error made at another timestep. Once a small state error exists, the remaining marginal dynamics can amplify, rotate, or suppress it. Path-Weighted Flow Matching therefore aims to assign a larger scalar training weight to timesteps whose local errors contribute more strongly to endpoint error.
+</p>
+
+<p>
+The ideal local-to-endpoint sensitivity is represented by the state-transition operator \(\Phi(1,t)\). A natural scalar summary for isotropic local errors is
+</p>
+
+\[
+w_{\mathrm{avg}}(t)
+=
+\mathbb E_{x_t\sim p_t}
+\left[
+\frac{1}{d}\|\Phi(1,t)\|_F^2
+\right].
+\]
+
+<p>
+The purpose of this experiment is to estimate this quantity as a <b>reference curve</b> directly from the target latent distribution, without using a trained Flow Matching model and without replacing the full local dynamics by a scalar Jacobian approximation.
+</p>
+
+<h3>0.3 What this program should do</h3>
+
+<p>
+The program will:
+</p>
+
+<ol>
+<li>represent the target latent distribution by an equally weighted shared-\(\sigma\) GMM;</li>
+<li>evaluate the corresponding analytical reference marginal velocity \(v(x,t)\);</li>
+<li>sample query states \(x_t\sim p_t\);</li>
+<li>apply a small random perturbation at time \(t\);</li>
+<li>integrate the unperturbed and perturbed states forward through the same reference marginal ODE;</li>
+<li>measure their endpoint separation and average it over probes and query states;</li>
+<li>produce \(w_{\mathrm{avg}}(t)\), uncertainty estimates, and numerical-convergence plots.</li>
+</ol>
+
+<div class="box">
+<b>Scope.</b> This is an offline diagnostic/reference experiment. It does not train a neural velocity model. Its main use is to test how well simpler analytical timestep weights approximate the error amplification of a more faithful target-distribution model.
+</div>
+
+<h2 id="goal">1. Target quantity</h2>
+
+<p>Let the reference marginal ODE be</p>
+\[
+\frac{dx_s}{ds}=v(x_s,s).
+\tag{1}
+\]
+
+<p>Let \(F_{t\to1}(x)\) denote the flow map obtained by integrating Eq. (1) from time \(t\) to time \(1\). For a small perturbation \(\delta x_t\),</p>
+\[
+\delta x_1 \approx \Phi(1,t)\,\delta x_t,
+\tag{2}
+\]
+<p>where \(\Phi(1,t)\) is the state-transition operator of the reference marginal flow.</p>
+
+<p>For a query state \(x_t\), define</p>
+\[
+w(x_t,t)
+=
+\frac{1}{d}\operatorname{tr}\!\left(\Phi(1,t)^\top\Phi(1,t)\right)
+=
+\frac{1}{d}\|\Phi(1,t)\|_F^2,
+\tag{3}
+\]
+<p>where \(d=4\times8\times8=256\) is the dimensionality of the provided down-sampled latent code.</p>
+
+<p>The desired reference curve is</p>
+\[
+\boxed{
+w_{\mathrm{avg}}(t)
+=
+\mathbb E_{x_t\sim p_t}
+\left[w(x_t,t)\right].
+}
+\tag{4}
+\]
+
+<div class="warn">
+<b>Terminology.</b> Call this a <i>reference</i> \(w_{\mathrm{avg}}\), not unconditional ground truth. It is exact only relative to the selected GMM target model, the induced marginal flow, the numerical ODE solve, and the infinitesimal-perturbation limit.
+</div>
+
+<h2 id="target">2. Shared-\(\sigma\) GMM target latent distribution</h2>
+
+<p>The target distribution is fixed to</p>
+\[
+\boxed{
+p_1(y)
+=
+\frac{1}{N}
+\sum_{i=1}^{N}
+\mathcal N\!\left(y;\mu_i,\sigma^2I\right).
+}
+\tag{5}
+\]
+
+<p>Here:</p>
+<ul>
+<li>\(N\) is the number of target latent samples / GMM components.</li>
+<li>\(\mu_i\) is the center of component \(i\), taken from the pre-encoded target latents.</li>
+<li>\(\sigma\) is one scalar standard deviation shared by <b>all</b> GMM components.</li>
+<li>All components have equal weight \(1/N\). There is no configurable component-wise mixture weight.</li>
+</ul>
+
+<div class="box">
+<b>Data source.</b> Load the already down-sampled ImageNet latent codes from:<br/>
+<code>/scratch/project/prj-02-visual-ai/hkzhang/ILSVRC/latents_8_mean_fp16/train</code>
+<br/><br/>
+Each latent has shape <code>4 × 8 × 8</code>, so the working latent dimensionality is \(d=256\). Use these latent vectors directly as the GMM component centers \(\mu_i\). No additional pooling or spatial downsampling should be performed by this project.
+</div>
+
+<h2 id="velocity">3. Compute the reference marginal velocity</h2>
+
+<p>The standard independent conditional interpolation is used only to derive and sample the marginal distribution:</p>
+\[
+x_t=(1-t)x_0+t y,
+\qquad
+x_0\sim\mathcal N(0,I),
+\qquad
+y\sim p_1.
+\tag{6}
+\]
+
+<div class="warn">
+Eq. (6) is the conditional coupling used to construct \(p_t\). It is <b>not</b> the trajectory followed by the marginal ODE.
+</div>
+
+<p>Conditioned on GMM component \(i\),</p>
+\[
+y\mid i\sim\mathcal N(\mu_i,\sigma^2I).
+\tag{7}
+\]
+
+<p>Therefore the time-\(t\) component marginal is</p>
+\[
+x_t\mid i
+\sim
+\mathcal N\!\left(
+t\mu_i,\,
+s_t^2I
+\right),
+\tag{8}
+\]
+<p>where the shared time-dependent component variance is</p>
+\[
+\boxed{
+s_t^2=(1-t)^2+t^2\sigma^2.
+}
+\tag{9}
+\]
+
+<p>At a query point \((x,t)\), the posterior responsibility of component \(i\) is</p>
+\[
+\boxed{
+r_i(x,t)
+=
+\frac{
+\mathcal N(x;t\mu_i,s_t^2I)
+}{
+\sum_{j=1}^{N}
+\mathcal N(x;t\mu_j,s_t^2I)
+}.
+}
+\tag{10}
+\]
+
+<p>Because all components have equal prior weight \(1/N\), that common factor cancels from numerator and denominator.</p>
+
+<h3>3.1 Component-wise marginal velocity</h3>
+
+<p>For component \(i\), the conditional velocity of the linear interpolation is</p>
+\[
+u=y-x_0.
+\]
+
+<p>Given that the query point satisfies \(x_t=x\), the required component velocity is the conditional expectation</p>
+\[
+\boxed{
+v_i(x,t)
+=
+\mathbb E[y-x_0\mid x_t=x,\ i].
+}
+\tag{11}
+\]
+
+<p>Since \(x_0\) and \(y\mid i\) are Gaussian and \(x_t=(1-t)x_0+ty\) is linear in them, the pair \((y-x_0,x_t)\) is jointly Gaussian. The Gaussian conditional-mean identity gives</p>
+\[
+\mathbb E[A\mid B=b]
+=
+\mathbb E[A]
++
+\operatorname{Cov}(A,B)
+\operatorname{Var}(B)^{-1}
+\left(b-\mathbb E[B]\right).
+\tag{12}
+\]
+
+<p>For</p>
+\[
+A=y-x_0,
+\qquad
+B=x_t,
+\]
+<p>the required moments are</p>
+\[
+\mathbb E[A]=\mu_i,
+\qquad
+\mathbb E[B]=t\mu_i,
+\tag{13}
+\]
+\[
+\operatorname{Var}(B)
+=
+s_t^2I,
+\tag{14}
+\]
+\[
+\operatorname{Cov}(A,B)
+=
+\left[t\sigma^2-(1-t)\right]I.
+\tag{15}
+\]
+
+<p>Substituting Eqs. (13)-(15) into Eq. (12) yields</p>
+\[
+\boxed{
+v_i(x,t)
+=
+\mu_i
++
+\frac{
+t\sigma^2-(1-t)
+}{
+(1-t)^2+t^2\sigma^2
+}
+\left(x-t\mu_i\right).
+}
+\tag{16}
+\]
+
+<div class="box">
+<b>Interpretation of Eq. (16).</b>
+The first term \(\mu_i\) is the mean conditional velocity for component \(i\). The second term corrects that mean according to where the query \(x\) lies relative to the component's time-\(t\) center \(t\mu_i\). The scalar coefficient is determined by the correlation between the instantaneous velocity \(y-x_0\) and the intermediate state \(x_t\). Before the minimum-scale point it is negative (component contraction); after that point it is positive (component expansion).
+</div>
+
+<h3>3.2 Reference marginal velocity</h3>
+
+<p>The full marginal velocity is the responsibility-weighted conditional expectation over GMM components:</p>
+\[
+\boxed{
+v(x,t)
+=
+\sum_{i=1}^{N}
+r_i(x,t)\,v_i(x,t).
+}
+\tag{17}
+\]
+
+<p>Eq. (17) is the velocity used for every forward ODE evaluation.</p>
+
+<h2 id="queries">4. Sample query states \(x_t\sim p_t\)</h2>
+
+<p>For each query:</p>
+\[
+i\sim\mathrm{Uniform}\{1,\ldots,N\},
+\qquad
+y=\mu_i+\sigma\epsilon_y,
+\qquad
+\epsilon_y\sim\mathcal N(0,I),
+\tag{20}
+\]
+\[
+x_0\sim\mathcal N(0,I),
+\qquad
+\boxed{
+x_t=(1-t)x_0+t y.
+}
+\tag{21}
+\]
+
+<p>Eq. (21) is used only to draw a state from the correct marginal \(p_t\). Once \(x_t\) is sampled, propagate it to the endpoint using the marginal ODE in Eq. (1) with velocity Eq. (17).</p>
+
+<h2 id="forward">5. Forward perturbation estimator</h2>
+
+<p>For each query \(x_t\), draw</p>
+\[
+u\sim\mathcal N(0,I).
+\tag{22}
+\]
+
+<p>Propagate the unperturbed reference state</p>
+\[
+x_1
+=
+F_{t\to1}(x_t),
+\tag{23}
+\]
+<p>and the perturbed state</p>
+\[
+x_1^{(+)}
+=
+F_{t\to1}(x_t+\varepsilon u).
+\tag{24}
+\]
+
+<p>For sufficiently small \(\varepsilon\),</p>
+\[
+\frac{x_1^{(+)}-x_1}{\varepsilon}
+\approx
+\Phi(1,t)u.
+\tag{25}
+\]
+
+<p>Since \(\mathbb E[uu^\top]=I\),</p>
+\[
+\mathbb E_u
+\left[
+\left\|
+\frac{x_1^{(+)}-x_1}{\varepsilon}
+\right\|_2^2
+\right]
+\rightarrow
+\|\Phi(1,t)\|_F^2.
+\tag{26}
+\]
+
+<p>With \(K\) probes,</p>
+\[
+\boxed{
+\widehat w(x_t,t)
+=
+\frac{1}{Kd\varepsilon^2}
+\sum_{k=1}^{K}
+\left\|
+F_{t\to1}(x_t+\varepsilon u_k)
+-
+F_{t\to1}(x_t)
+\right\|_2^2.
+}
+\tag{27}
+\]
+
+<p>With \(M\) marginal query states,</p>
+\[
+\boxed{
+\widehat w_{\mathrm{avg}}(t)
+=
+\frac1M
+\sum_{m=1}^{M}
+\widehat w(x_t^{(m)},t).
+}
+\tag{28}
+\]
+
+<h3>Optional central difference</h3>
+\[
+\Phi(1,t)u
+\approx
+\frac{
+F_{t\to1}(x_t+\varepsilon u)
+-
+F_{t\to1}(x_t-\varepsilon u)
+}{
+2\varepsilon
+}.
+\tag{29}
+\]
+<p>This roughly doubles ODE cost per probe but reduces finite-difference bias.</p>
+
+<h2 id="algorithm">6. End-to-end algorithm and configuration</h2>
+
+<h3>6.1 What each configuration control means</h3>
+
+<table>
+<thead>
+<tr><th>Configuration item</th><th>Meaning / why it exists</th></tr>
+</thead>
+<tbody>
+<tr>
+<td><code>latent_root</code></td>
+<td>Directory containing the pre-encoded target latents used as GMM centers \(\mu_i\).</td>
+</tr>
+<tr>
+<td><code>num_target_samples</code></td>
+<td>Number \(N\) of target latent centers included in the GMM. By default, use <b>all latent codes found under <code>latent_root</code></b>. An optional integer limit may be provided only for development or convergence tests.</td>
+</tr>
+<tr>
+<td><code>component_sigma</code></td>
+<td>The single shared GMM component standard deviation \(\sigma\). Every target component is \(\mathcal N(\mu_i,\sigma^2I)\). This is not component-specific.</td>
+</tr>
+<tr>
+<td><code>time.num_points</code>, <code>t_min</code>, <code>t_max</code></td>
+<td>Define the timestep grid where \(w_{\mathrm{avg}}(t)\) is estimated. A denser grid gives a smoother and more precise curve but requires more ODE solves.</td>
+</tr>
+<tr>
+<td><code>monte_carlo.num_query_states</code> (\(M\))</td>
+<td>Number of independently sampled marginal query states \(x_t\sim p_t\) at each timestep. This controls Monte Carlo accuracy of the outer expectation over states.</td>
+</tr>
+<tr>
+<td><code>monte_carlo.num_probes</code> (\(K_{\mathrm{probe}}\))</td>
+<td>Number of random perturbation directions \(u\) used for each query state. This controls the accuracy of the directional estimate of \(\|\Phi(1,t)\|_F^2/d\). It is unrelated to a GMM cluster count.</td>
+</tr>
+<tr>
+<td><code>epsilon_alpha</code></td>
+<td>Sets perturbation magnitude through \(\varepsilon=\alpha s_t\), where \(s_t\) is a typical per-coordinate RMS scale of \(x_t\). It must be small enough for linearization but large enough to dominate ODE and floating-point error.</td>
+</tr>
+<tr>
+<td><code>responsibility_log_cutoff</code> (\(\tau\))</td>
+<td>Controls pruning of GMM components whose likelihood is negligible relative to the most likely component. Default \(\tau=30\). Section 9.2 explains the numerical bound.</td>
+</tr>
+<tr>
+<td><code>ode.solver</code>, <code>rtol</code>, <code>atol</code></td>
+<td>Numerical integrator and error tolerances for the marginal ODE. These must be tight enough that ODE numerical error is much smaller than the perturbation-induced endpoint difference.</td>
+</tr>
+<tr>
+<td><code>distributed.num_gpus</code></td>
+<td>Number of GPUs used for distributed evaluation. Production target: 8 GPUs.</td>
+</tr>
+<tr>
+<td><code>output.output_dir</code></td>
+<td>Directory for resolved config, logs, intermediate per-timestep statistics, CSV/JSON values, and figures.</td>
+</tr>
+</tbody>
+</table>
+
+<h3>6.2 Computational procedure</h3>
+
+<pre>Inputs from config:
+  latent_root
+  num_target_samples = all          # default; optional integer limit for development
+  component_sigma
+  time grid T = {t_1,...,t_L}
+  M = query states per t
+  K_probe = perturbation directions per query
+  epsilon rule: eps = alpha * s_t
+  responsibility pruning cutoff tau
+  ODE solver and tolerances
+  distributed / GPU settings
+
+Precompute:
+  1. Discover all latent files/records under latent_root.
+  2. Load all latent codes by default as GMM centers mu_i.
+     Each latent is already 4 x 8 x 8; do not pool or downsample again.
+  3. Show loading progress, elapsed time, throughput, and ETA during loading.
+  4. Flatten each latent to d = 256 for GMM computation.
+  5. Implement reference_velocity(x,t) using the shared-sigma GMM formulas.
+
+For each t in T:
+    per_state = []
+
+    for each distributed query-state batch:
+        # A. Draw x_t from the shared-sigma GMM-induced marginal.
+        x_t = sample_gmm_marginal(t)
+
+        # B. Unperturbed reference endpoint.
+        x1 = solve_marginal_ode(x_t, t, 1)
+
+        # C. Perturbation probes.
+        for k in 1..K_probe:
+            u = Normal(0, I)
+            x1p = solve_marginal_ode(x_t + eps*u, t, 1)
+            g = (x1p - x1) / eps
+            w_query_probe = ||g||^2 / d
+
+        w_query = mean_over_probes(w_query_probe)
+
+    # D. Distributed reduction across 8 GPUs.
+    w_avg[t] = global_mean(w_query)
+    stderr[t] = global_standard_error(w_query)
+
+Optional normalization:
+    w_norm(t) = w_avg(t) / integral_0^1 w_avg(s) ds
+</pre>
+
+<h2 id="validation">7. Validation before the full experiment</h2>
+
+<h3>7.1 Single isotropic Gaussian sanity check</h3>
+
+<p>Set</p>
+\[
+p_1=\mathcal N(0,\sigma^2I).
+\tag{30}
+\]
+
+<p>Then</p>
+\[
+c(t)^2=(1-t)^2+\sigma^2t^2,
+\tag{31}
+\]
+<p>and the exact squared amplification is</p>
+\[
+\boxed{
+w(t)
+=
+\frac{\sigma^2}
+{(1-t)^2+\sigma^2t^2}.
+}
+\tag{32}
+\]
+
+<p>The peak must occur at</p>
+\[
+\boxed{
+t_{\mathrm{peak}}
+=
+\frac{1}{1+\sigma^2}.
+}
+\tag{33}
+\]
+
+<p>The implementation must reproduce both the analytical curve and peak position before the ImageNet experiment.</p>
+
+<h3>7.2 Perturbation-size convergence and \(\varepsilon\) sweep</h3>
+
+<p>Because \(u\sim\mathcal N(0,I)\), \(\varepsilon\) is the RMS perturbation scale per coordinate. Define the typical marginal RMS scale</p>
+\[
+s_t
+=
+\sqrt{
+\mathbb E_{x_t\sim p_t}
+\left[
+\frac{\|x_t\|_2^2}{d}
+\right]
+}.
+\tag{34}
+\]
+
+<p>Use</p>
+\[
+\varepsilon=\alpha s_t.
+\tag{35}
+\]
+
+<p>For the initial test, sweep</p>
+\[
+\boxed{
+\alpha
+\in
+\{10^{-4},\,3\times10^{-4},\,10^{-3},\,3\times10^{-3},\,10^{-2},\,3\times10^{-2}\}.
+}
+\tag{36}
+\]
+
+<ul>
+<li>Large \(\alpha\): nonlinear finite-difference bias.</li>
+<li>Very small \(\alpha\): floating-point cancellation and ODE solver error.</li>
+<li>Select \(\alpha\) from a stable plateau where the resulting \(w_{\mathrm{avg}}\) curve changes minimally as \(\alpha\) varies.</li>
+</ul>
+
+<h3>7.3 Monte Carlo convergence</h3>
+<p>Increase \(M\) and \(K\) independently and measure how the estimated curve and sampling uncertainty change. In high dimension, increasing \(M\) may be more useful than using a large \(K\) for each query state.</p>
+
+<h2 id="numerics">8. Numerical and computational issues</h2>
+
+<h3>8.1 Stable responsibility computation: log-space normalization</h3>
+
+<p>
+At fixed \(t\), all GMM components have equal prior weight and the same covariance \(s_t^2I\). Therefore, when computing responsibilities, all Gaussian normalization constants are common across components and cancel. It is sufficient to use the relative log score
+</p>
+
+\[
+\ell_i(x,t)
+=
+-\frac{\|x-t\mu_i\|_2^2}{2s_t^2}.
+\]
+
+<p>
+A direct implementation of \(\exp(\ell_i)\) is unsafe in high dimension: squared distances can be large, making essentially every Gaussian density underflow to zero in floating point. The stable strategy is to subtract the largest log score before exponentiation:
+</p>
+
+\[
+m=\max_i\ell_i,
+\qquad
+r_i
+=
+\frac{\exp(\ell_i-m)}
+{\sum_j\exp(\ell_j-m)}.
+\]
+
+<p>
+Now the largest exponential is exactly \(1\), and every other exponential lies in \((0,1]\). This removes the irrelevant absolute density scale and preserves the relative probabilities needed by the marginal velocity.
+</p>
+
+<pre>score_i = - squared_distance(x, t * mu_i) / (2 * s_t_sq)
+
+global_max = max(score_i over ALL N components)
+shifted_i  = score_i - global_max
+
+# pruning is applied only after global_max is known
+keep = shifted_i >= -tau
+
+denominator = sum(exp(shifted_i[keep]))
+r_i = exp(shifted_i[keep]) / denominator</pre>
+
+<div class="box">
+<b>Chunked / distributed requirement.</b> The maximum must be the maximum over all \(N\) components, not the maximum of an independently normalized chunk. If components are processed in chunks, first obtain the global maximum (or use an equivalent online log-sum-exp algorithm), then accumulate the globally shifted exponential sum and velocity numerator. If components are sharded over GPUs, use distributed reductions for the global maximum and global sums.
+</div>
+
+<h3>8.2 Prune numerically negligible components</h3>
+
+<p>
+After the global maximum log score \(m\) has been found, drop a component when
+</p>
+
+\[
+\boxed{
+\ell_i < m-\tau.
+}
+\tag{37}
+\]
+
+<p>
+For the default \(\tau=30\), every dropped component has unnormalized weight at most
+</p>
+
+\[
+e^{-30}\approx9.36\times10^{-14}
+\]
+
+<p>
+times the maximum component weight. This is not only an underflow safeguard; it also avoids spending most of the computation on components whose contribution to the marginal velocity is negligible.
+</p>
+
+<p>
+There is a simple worst-case bound. If the loader discovers \(N\) total components, the total posterior mass that can be discarded is bounded by
+</p>
+
+\[
+\text{dropped mass}
+\le
+N e^{-\tau},
+\]
+
+<p>
+because the normalizing denominator is at least the maximum component weight. Since production uses all available latents, \(N\) is determined at runtime. The program should report the corresponding bound \(N e^{-\tau}\) for the configured cutoff.
+</p>
+
+<p>
+More generally, to target a worst-case omitted mass below \(\delta\), choose
+</p>
+
+\[
+\tau \ge \log\!\left(\frac{N}{\delta}\right).
+\]
+
+<div class="warn">
+<b>Important.</b> Pruning is applied during responsibility evaluation; it does not change how query states are sampled from the GMM. Always renormalize the retained responsibilities. Keep \(\tau\) configurable and verify on a smaller run that increasing \(\tau\) does not change the resulting \(w_{\mathrm{avg}}(t)\) curve appreciably.
+</div>
+
+<h3>8.3 Complexity</h3>
+
+\[
+O\!\left(
+L\,M\,(K+1)\,S\,N\,d
+\right),
+\tag{39}
+\]
+<p>where \(L\) is the number of queried times, \(S\) is the number of marginal-velocity evaluations made by the ODE solver, \(N\) is the number of GMM components, and \(d\) is pooled latent dimension.</p>
+
+<p>The dominant cost is evaluating component likelihoods/responsibilities at every marginal-velocity query.</p>
+
+<h3>8.4 Safe acceleration</h3>
+<ul>
+<li><b>Chunk over GMM components:</b> exact if all chunks participate in the global log-sum-exp and weighted numerator.</li>
+<li><b>Batch query and perturbation states:</b> exact.</li>
+<li><b>Responsibility cutoff:</b> approximate; configurable and validated.</li>
+<li><b>Cache time-dependent shared scalars:</b> \(s_t^2\), its inverse, and Gaussian normalization terms.</li>
+</ul>
+
+<h3>8.5 Finite-difference ODE consistency</h3>
+
+<p>
+The purpose of this section is to make sure the measured endpoint difference is caused by the initial perturbation \(\varepsilon u\), rather than by unrelated numerical error from the two ODE solves.
+</p>
+
+<p>The ideal estimator uses</p>
+
+\[
+\frac{
+F_{t\to1}(x_t+\varepsilon u)
+-
+F_{t\to1}(x_t)
+}{\varepsilon}.
+\]
+
+<p>
+Suppose the numerical ODE solver returns \(F+\eta\), where \(\eta\) is its endpoint integration error. Then the actual finite-difference estimate contains
+</p>
+
+\[
+\frac{\eta_{+}-\eta_{0}}{\varepsilon}.
+\]
+
+<p>
+Because this error is divided by \(\varepsilon\), it can become important precisely when \(\varepsilon\) is made very small. This is why the \(\varepsilon\)-convergence test and the ODE-tolerance test must be considered together.
+</p>
+
+<p>Implementation requirements:</p>
+<ul>
+<li>use the same reference marginal velocity code for both trajectories;</li>
+<li>use the same ODE solver and identical tolerances;</li>
+<li>prefer a deterministic fixed-step/common time grid for the finite-difference experiment when practical; if an adaptive solver is used, require sufficiently tight tolerances;</li>
+<li>repeat a subset of the experiment with tighter ODE tolerances and verify that \(w_{\mathrm{avg}}(t)\) is stable;</li>
+<li>choose \(\varepsilon\) only from a regime where the perturbation signal is clearly larger than the solver-induced endpoint noise.</li>
+</ul>
+
+<div class="box">
+<b>FP32 recommendation.</b> Keep GMM distances, log scores, responsibilities, states, velocities, and ODE integration in FP32. Integrate the unperturbed state and all perturbations together in one batched ODE solve whenever practical so they share the same solver time grid/step decisions. Use FP64 only for inexpensive final scalar reductions (means, variances, confidence intervals) if desired.
+</div>
+
+<div class="box">
+<b>Intention of Sec. 8.5.</b> It is not an additional modeling assumption. It is a numerical-control condition for the finite-difference measurement of \(\Phi(1,t)u\).
+</div>
+
+<h2 id="outputs">9. Required outputs and figures</h2>
+
+<ol>
+<li>
+<b>Raw curve.</b> Save numerical values of \(\widehat w_{\mathrm{avg}}(t)\) to CSV/JSON and plot \(t\) versus raw \(\widehat w_{\mathrm{avg}}(t)\).
+</li>
+<li>
+<b>Normalized curve.</b> Compute
+\[
+\widetilde w(t)
+=
+\frac{
+w_{\mathrm{avg}}(t)
+}{
+\int_0^1 w_{\mathrm{avg}}(s)\,ds
+}
+\tag{42}
+\]
+and plot the normalized curve.
+</li>
+<li>
+<b>Sampling uncertainty and confidence band.</b> At each \(t\), retain the per-query estimates \(\widehat w_m(t)\), compute
+\[
+\mathrm{SE}(t)
+=
+\frac{\mathrm{Std}_m[\widehat w_m(t)]}{\sqrt{M}},
+\tag{43}
+\]
+and plot the mean curve with a shaded mean \(\pm1.96\,\mathrm{SE}(t)\) band. This measures Monte Carlo uncertainty across sampled marginal query states.
+</li>
+<li>
+<b>Peak location.</b> Report \(t_{\mathrm{peak}}\) numerically and mark it on the raw and normalized plots.
+</li>
+<li>
+<b>Single-Gaussian sanity-check figure.</b> Plot the numerical estimate against the analytical Eq. (32), and report curve error plus peak-location error.
+</li>
+<li>
+<b>Convergence figures.</b> Plot the \(\varepsilon\)-sweep and selected \(M/K\) convergence tests to demonstrate numerical stability.
+</li>
+</ol>
+
+<p>Save all figures as PNG and, when practical, PDF. Save the underlying numerical data used for every plot.</p>
+
+<h2 id="implementation">10. Implementation requirements</h2>
+
+<h3>10.1 Multi-GPU execution</h3>
+<ul>
+<li>The implementation must run on <b>8 GPUs</b>.</li>
+<li>Use PyTorch distributed execution, preferably <code>torchrun --nproc_per_node=8</code>.</li>
+<li>Distribute query states / perturbation trajectories across GPUs and globally reduce final statistics.</li>
+<li>If GMM components are sharded across GPUs rather than replicated, perform mathematically correct distributed log-sum-exp and weighted-sum reductions. Never normalize responsibilities independently on each GPU and then average them.</li>
+</ul>
+
+<h3>10.2 Configuration file</h3>
+
+<p>Provide a human-readable configuration file, preferably YAML:</p>
+
+<pre>data:
+  latent_root: /scratch/project/prj-02-visual-ai/hkzhang/ILSVRC/latents_8_mean_fp16/train
+  num_target_samples: all          # default; optional integer for development
+  sampling_seed: 0
+
+gmm:
+  component_sigma: ...
+
+
+time:
+  num_points: ...
+  t_min: ...
+  t_max: ...
+
+monte_carlo:
+  num_query_states: ...
+  num_probes: ...
+  epsilon_alpha: ...
+  responsibility_log_cutoff: 30
+
+ode:
+  solver: ...
+  rtol: ...
+  atol: ...
+
+distributed:
+  num_gpus: 8
+
+output:
+  output_dir: ...
+</pre>
+
+<p>The exact key names can differ, but all listed controls must be configurable without source-code edits. Section 6.1 defines the intended meaning of each control.</p>
+
+<h3>10.3 Target sample count</h3>
+
+<p>
+The production default is to use <b>all latent codes available under <code>latent_root</code></b>. Let the number discovered at runtime be \(N\). The loader should enumerate/count the available latent records first, report the discovered \(N\), and then construct an equally weighted GMM with weight \(1/N\) per component.
+</p>
+
+<p>
+The config may optionally accept an integer <code>num_target_samples</code> for development, profiling, and convergence tests. If an integer smaller than the discovered dataset size is supplied, select that many centers reproducibly using the configured seed. Production runs should use <code>all</code>.
+</p>
+
+<h3>10.4 Reproducibility and logging</h3>
+
+<ul>
+<li>Set explicit random seeds for target-component subsampling, marginal query sampling, and perturbation probes.</li>
+<li>Log the fully resolved config at the start of every run.</li>
+<li>Log per-time retained-component counts/fractions after responsibility pruning.</li>
+<li>Log runtime, GPU memory, ODE function evaluations, and numerical failures.</li>
+<li>Save intermediate per-time results so long runs can resume without recomputing completed times.</li>
+</ul>
+
+<h3>10.5 Latent loading progress</h3>
+
+<ul>
+<li>Show a dedicated progress bar while discovering/reading the latent codes from <code>latent_root</code>.</li>
+<li>The loading display should show at least:
+  <ul>
+    <li>loaded latent count / total discovered latent count;</li>
+    <li>percentage completed;</li>
+    <li>elapsed time;</li>
+    <li>ETA;</li>
+    <li>loading throughput, such as latents per second.</li>
+  </ul>
+</li>
+<li>On distributed runs, avoid overlapping progress output from all 8 ranks. Prefer rank 0 for user-visible loading progress.</li>
+<li>After loading, print the final number of GMM centers \(N\), latent shape <code>4 × 8 × 8</code>, flattened dimension \(d=256\), source dtype, and memory footprint.</li>
+</ul>
+
+<h3>10.6 Progress and ETA reporting</h3>
+
+<ul>
+<li>During every test and production run, show a live progress indicator and estimated time remaining (ETA).</li>
+<li>On multi-GPU runs, only rank 0 should print the main progress bar to avoid duplicated output.</li>
+<li>The progress display should include at least:
+  <ul>
+    <li>current \(t\) index / total time points;</li>
+    <li>completed query states / total query states;</li>
+    <li>current stage (query sampling, unperturbed ODE, perturbed ODEs, reduction, plotting);</li>
+    <li>elapsed time;</li>
+    <li>ETA;</li>
+    <li>optional throughput such as query states per second or ODE solves per second.</li>
+  </ul>
+</li>
+<li>Use a progress utility such as <code>tqdm</code>, or an equivalent implementation that provides reliable ETA.</li>
+<li>For long jobs, periodically write the same progress information to the log file so progress remains inspectable after SSH disconnection.</li>
+</ul>
+
+<div class="box">
+<b>Critical rule for the code agent.</b><br/>
+Conditional interpolation is used only to derive and sample \(p_t\). It must <b>not</b> be used to propagate the unperturbed or perturbed query to the endpoint. Both trajectories must be integrated through the <b>reference marginal velocity field</b> \(v(x,t)\) in Eq. (17).
+</div>
+
+<h2>References</h2>
+<ul>
+<li>Lipman et al., <i>Flow Matching for Generative Modeling</i>: <a href="https://arxiv.org/abs/2210.02747">https://arxiv.org/abs/2210.02747</a></li>
+<li>Chen et al., <i>Neural Ordinary Differential Equations</i>: <a href="https://arxiv.org/abs/1806.07366">https://arxiv.org/abs/1806.07366</a></li>
+<li>Kingma &amp; Welling, <i>Auto-Encoding Variational Bayes</i>: <a href="https://arxiv.org/abs/1312.6114">https://arxiv.org/abs/1312.6114</a></li>
+</ul>
+
+<p class="small">MathJax is loaded from a CDN for equation rendering; the LaTeX source remains in the HTML if opened offline.</p>
+
+</main></body></html>

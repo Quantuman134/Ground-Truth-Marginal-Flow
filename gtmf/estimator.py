@@ -5,6 +5,8 @@ state to t = 1 through the marginal ODE, and see how much the gap between them
 grew. That ratio is Phi; w is its square, averaged over directions.
 """
 
+import math
+
 import torch
 
 from .integrate import rk4
@@ -109,3 +111,30 @@ def w_hat(field, x, t, eps, num_probes, h, generator=None,
         gaps = (ends[:num_probes] - ends[num_probes:]) / (2.0 * eps)
 
     return gaps.pow(2).sum(dim=-1).mean(dim=0) / x.shape[1]
+
+
+def mean_and_stderr(w):
+    """Aggregate per-query estimates into w_avg(t) and its uncertainty.
+
+        w -> (mean, stderr),  stderr = Std_m[w_m] / sqrt(M)      spec Eq. 43
+
+    This is Monte-Carlo uncertainty across the sampled query states -- how well M
+    draws pin down the expectation over p_t. It is NOT the error in w itself,
+    which also carries the finite-difference bias and the ODE's discretisation
+    error; those are what the alpha sweep and the halve-h check bound.
+
+    Returns Python floats: this runs once per timepoint, well off the hot path,
+    and the values go straight to CSV.
+    """
+    if w.dim() != 1:
+        raise ValueError(f"expected per-query estimates of shape (M,), got {tuple(w.shape)}")
+    if w.numel() == 0:
+        raise ValueError("no query states to aggregate")
+
+    mean = float(w.mean())
+    if w.numel() < 2:
+        # One draw says nothing about spread. NaN, not 0.0: a zero here would be
+        # plotted as a confidence band of zero width, claiming a precision that
+        # was never measured.
+        return mean, math.nan
+    return mean, float(w.std(unbiased=True)) / math.sqrt(w.numel())

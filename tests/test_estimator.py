@@ -1,5 +1,6 @@
 """Tests for gtmf/estimator.py."""
 
+import math
 import sys
 from pathlib import Path
 
@@ -327,3 +328,75 @@ def test_a_too_coarse_integrator_shows_up_in_w():
     coarse = w_hat(linear_field(0.3), x, 0.4, h=1 / 4, num_probes=8, eps=1e-3,
                    generator=gen(48), integrator=euler)
     assert not torch.allclose(coarse, good, rtol=1e-2)
+
+
+# --------------------------------------------------------------------------- #
+# aggregation
+# --------------------------------------------------------------------------- #
+
+from gtmf.estimator import mean_and_stderr                      # noqa: E402
+
+
+def test_mean_and_stderr_against_a_hand_computed_case():
+    """w = [1,2,3,4]: mean 2.5; deviations -1.5,-0.5,0.5,1.5 give sum of squares 5,
+    so the unbiased variance is 5/3, std sqrt(5/3) = 1.290994, and the standard
+    error is that over sqrt(4) = 0.645497."""
+    mean, se = mean_and_stderr(torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float64))
+    assert mean == pytest.approx(2.5)
+    assert se == pytest.approx(0.6454972243679028)
+
+
+def test_stderr_falls_as_one_over_root_m():
+    """The defining property. An aggregation that ignored M would still return a
+    plausible mean, and only this catches it."""
+    g = torch.Generator().manual_seed(60)
+    pool = torch.randn(65536, generator=g, dtype=torch.float64)
+    ses = [mean_and_stderr(pool[:m])[1] for m in (256, 1024, 4096)]
+    assert ses[0] / ses[1] == pytest.approx(2.0, rel=0.25)      # sqrt(4)
+    assert ses[1] / ses[2] == pytest.approx(2.0, rel=0.25)
+
+
+def test_a_single_query_has_a_mean_but_no_measurable_spread():
+    """NaN rather than 0.0: a zero would be drawn as a zero-width confidence band,
+    claiming a precision that was never measured."""
+    mean, se = mean_and_stderr(torch.tensor([3.25], dtype=torch.float64))
+    assert mean == pytest.approx(3.25)
+    assert math.isnan(se)
+
+
+def test_identical_estimates_give_exactly_zero_spread():
+    mean, se = mean_and_stderr(torch.full((32,), 2.0, dtype=torch.float64))
+    assert mean == pytest.approx(2.0) and se == pytest.approx(0.0)
+
+
+def test_it_returns_python_floats_not_tensors():
+    """They go straight to CSV, and a tensor would serialise as 'tensor(2.5)'."""
+    mean, se = mean_and_stderr(torch.randn(16, dtype=torch.float64))
+    assert isinstance(mean, float) and isinstance(se, float)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_it_accepts_either_precision(dtype):
+    mean, se = mean_and_stderr(torch.arange(1, 5, dtype=dtype))
+    assert mean == pytest.approx(2.5) and se == pytest.approx(0.6454972, rel=1e-5)
+
+
+def test_it_composes_with_w_hat():
+    """The pair this exists for: per-query w in, w_avg(t) +/- SE out."""
+    x = randn(128, 64, seed=61)
+    w = w_hat(linear_field(0.3), x, 0.4, eps=1e-3, num_probes=8, h=1 / 256,
+              generator=gen(62), scheme="central")
+    mean, se = mean_and_stderr(w)
+    assert mean == pytest.approx(schedule.w_exact(0.4, 0.3), rel=0.05)
+    assert 0.0 < se < 0.1 * mean
+
+
+@pytest.mark.parametrize("bad", [torch.zeros((4, 4)), torch.zeros(())])
+def test_a_non_vector_is_rejected(bad):
+    with pytest.raises(ValueError, match="shape"):
+        mean_and_stderr(bad)
+
+
+def test_an_empty_batch_is_rejected():
+    with pytest.raises(ValueError, match="no query states"):
+        mean_and_stderr(torch.zeros(0, dtype=torch.float64))

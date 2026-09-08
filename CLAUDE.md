@@ -99,7 +99,7 @@ but meaningless curve.
 | Logging | No W&B. CSV/JSON + PNG/PDF per Sec. 9. |
 | Normalization | Eq. 42 divides by the integral over the **actual grid** `[0, 0.98]`, not `[0,1]`. Never extrapolate into a region that was not measured; label plots with the real range. |
 | Sanity check | Separate `sanity_gaussian.py` — needs no data, no GPU, no distributed setup. |
-| Output dir | `results/<experiment>_<sigma>_<timestamp>/`, with the fully resolved config dumped inside. |
+| Output layout | **One invocation = one directory.** `results/<experiment>_<timestamp>/` holding `resolved_config.yaml` and `run.log` at the top (they belong to the run, not to each sigma), then one `sigma_<value>/` subdirectory per swept sigma. The timestamp is automatic so a re-run never destroys the previous one — production runs take hours and their raw per-query data is what the figures are redrawn from. A `--output PATH` override pins a stable path when a launcher wants one, and refuses an existing directory without `--force`. |
 
 ### Measured structure of the mixture (why sigma matters the way it does)
 

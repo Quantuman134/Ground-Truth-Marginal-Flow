@@ -102,23 +102,6 @@ alpha-dependence here is a bug in the estimator, not physics.
 
 ---
 
-## Phase 4 — Single-Gaussian sanity check
-
-**Deliverable:** `sanity_gaussian.py`
-
-Integration test of phases 1–3 against the one case with a closed form (spec §7.1).
-No data, no GPU, no distributed setup; runs in seconds. Field is
-`v(x,t) = k_t(t) * x` for `p_1 = N(0, sigma^2 I)`.
-
-**Gate:** reproduces `w(t) = sigma^2/c_t^2` across the 50-point grid to the accuracy
-budget; peak lands at `t = 1/(1+sigma^2)`; RK4 order ~4. **A failure here is a bug
-in the foundation, not in the mixture** — do not proceed past it.
-
-Produces the §9 sanity-check figure (numerical vs analytic, with curve error and
-peak-location error reported).
-
----
-
 ## Phase 5 — Consolidated centers file
 
 **Deliverable:** `build_centers.py`, `remote_bash_script/build_centers.sh`
@@ -220,6 +203,11 @@ form is kept for auditability against the spec.
 
 **Deliverable:** `wavg.py`
 
+The target is whatever the config says, including **a synthetic one**: a mixture
+with a single component at the origin *is* the single Gaussian, so the sanity
+check needs no special code path -- only a config. That is a requirement on this
+phase, not an afterthought.
+
 Wires phases 3, 6 and the config together at reduced scale (`N ~ 50 k`, small
 `M`/`K`): for each `t`, sample `M` query states, run the batched perturbation
 estimator through the marginal flow, aggregate to `w_avg(t)` and its standard
@@ -287,10 +275,45 @@ Reads only persisted raw estimates, so replotting never triggers a re-run.
 
 ---
 
+## Phase 11 — Sanity check, run as a real experiment
+
+**Deliverable:** `configs/sanity_gaussian.yaml`, and the comparison in `plots.py`
+
+Spec §7.1, executed through the production pipeline rather than a bespoke script.
+The target is a mixture with one component at the origin, which makes `p_1` exactly
+`N(0, sigma^2 I)` and the marginal field exactly `v = k_t x`. No data, no GPU, and
+it runs in seconds -- but through the same code every other run uses.
+
+Deliberately last. Its value as an early gate is already served by the test suite,
+which checks `w = sigma^2/c_t^2` end to end on every run; what remains is the §9
+figure and the reportable numbers, and those want the finished plotting code.
+
+**Gate:** reproduces `w(t) = sigma^2/c_t^2` across the grid to the accuracy budget,
+and the measured RK4 order comes out at ~4.
+
+**Peak location needs care.** `t_peak = 1/(1+sigma^2)` falls OUTSIDE the `[0, 0.98]`
+grid for two of the four production sigmas:
+
+| sigma | t_peak | inside the grid? |
+|---|---|---|
+| 0.01 | 0.9999 | no |
+| 0.1  | 0.9901 | no |
+| 0.3  | 0.9174 | yes |
+| 0.6  | 0.7353 | yes |
+
+For those two the curve is monotonically increasing across the whole grid and the
+true maximum sits just past the right edge. Reporting the argmax of the sampled
+curve would name 0.98 as the peak, which it is not. Report *peak not in range*
+instead -- and carry the same caveat into the production figures in phase 10.
+
 ## Sequencing notes
 
-- **Phases 0–4 and phase 5 are independent** and can proceed in parallel.
-  Phases 6 → 10 are strictly sequential.
+- **Execution order** (revised): 1, 2, 3, 5, 6 are done. Remaining: **0** (config),
+  then **7** (pipeline), **8** (convergence), **9** (distributed), **10** (figures),
+  and **11** (the sanity check, as a real run) last.
+- The sanity check moved to the end deliberately: as a correctness gate it is
+  redundant with the test suite, and as an experiment it wants the finished
+  pipeline and plotting code.
 - **Phase 6 is the one to slow down on.** It is where the project's only silent
   failure mode lives: a wrong field yields a smooth, plausible, meaningless curve.
   Its three gates are cheap; run all of them.

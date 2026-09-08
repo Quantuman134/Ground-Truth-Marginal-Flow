@@ -1,0 +1,104 @@
+# Reference w_avg(t) on the ImageNet latent mixture -- the production run.
+#
+# Every value here is a decision recorded in ../CLAUDE.md; the comments say why,
+# so this file doubles as the record of what was run. A resolved copy is written
+# into each output directory.
+#
+#   torchrun --standalone --nproc_per_node=8 wavg.py --config configs/wavg_imagenet.yaml
+
+experiment: wavg_imagenet
+
+data:
+  source: latents                 # "latents" | "synthetic"
+  latent_root: /scratch/project/prj-02-visual-ai/hkzhang/ILSVRC/latents_8_mean_fp16
+  num_target_samples: all         # "all" = every one of the 1,281,167 centres
+  apply_sd_scale: true            # values on disk are RAW; 0.18215 is applied at load
+
+gmm:
+  # Swept in one invocation, one output subdirectory each. 0.01 is the anchor.
+  # The upper bound is the data's own per-coordinate std, 0.589: past it the
+  # components are wider than the data and only a single Gaussian is left.
+  component_sigma: [0.01, 0.1, 0.3, 0.6]
+
+  # Pruning, spec 8.2. OFF: the streaming max already prevents underflow, the
+  # matmul covers every component either way so it saves nothing, and past
+  # t ~ 0.7 one component holds essentially all the mass. Implemented and proven
+  # by test not to change the answer at tau = 30; run at null.
+  responsibility_log_cutoff: null
+
+time:
+  num_points: 50
+  t_min: 0.0
+  t_max: 0.98                     # NOTE: t_peak = 1/(1+sigma^2) is OUTSIDE this
+                                  # range for sigma <= 0.1 -- report "peak not in
+                                  # range" there rather than the sampled argmax.
+
+monte_carlo:
+  num_query_states: 512           # M -- PLACEHOLDER, set in phase 8. The corrected
+                                  # budget says compute is not the constraint;
+                                  # Monte-Carlo error is, and it falls as 1/sqrt(M).
+  num_probes: 4                   # K
+  # Central (Eq. 29) over one-sided (Eq. 27): bias drops from O(eps) to
+  # O(eps^2) because the even Taylor terms cancel, which widens the usable
+  # alpha plateau away from the numerical floor. Costs 2K solves instead of
+  # K+1 -- 1.6x at K=4.
+  scheme: central
+
+  # eps = alpha * rho_t. Chosen BY HAND from the sweep's plateau, never
+  # automatically. Left null so a run without a chosen alpha fails loudly.
+  # Measured warning for phase 8: on a curved field the bias explodes between
+  # alpha 0.01 and 0.03 -- the perturbed state crosses into another component's
+  # basin -- so the plateau has a hard upper edge well below the spec's 3e-2.
+  epsilon_alpha:
+    default: null
+    by_sigma: {}
+
+  # rho_t from its closed form rather than measured from the sample: the exact
+  # value costs nothing and keeps sampling noise out of the perturbation size.
+  rho_source: exact               # "exact" | "empirical"
+
+ode:
+  integrator: rk4                 # "rk4" | "euler" (euler is for the order check only)
+  # Two tiers. Only sigma=0.01 needs the fine step; the rest reach 1.3e-6 or
+  # better at 1/64. A single global h is wrong in both directions: 1/512
+  # everywhere costs 3.2x for accuracy already 7 orders past the target at
+  # sigma=0.6, and 1/256 everywhere leaves sigma=0.01 only 17x margin.
+  step_size:
+    default: 0.015625             # 1/64
+    by_sigma:
+      0.01: 0.001953125           # 1/512
+
+compute:
+  device: cuda
+  dtype: float32                  # spec 8.5. Roundoff is highly correlated between
+                                  # the perturbed and unperturbed trajectories and
+                                  # largely cancels in the difference.
+  allow_tf32: false               # scores are a difference of large numbers over a
+                                  # small c_t^2; a 10-bit mantissa perturbs the
+                                  # responsibility exponent by ~200 against gaps
+                                  # of ~1e4, worst where sigma is smallest.
+  chunk_size: auto                # components per block; memory only, never results
+
+distributed:
+  num_gpus: 8                     # centres are REPLICATED, not sharded: 1.31 GB of
+                                  # 140 GB, so no distributed log-sum-exp is needed
+                                  # and each rank runs independently.
+
+output:
+  # One invocation = one directory. The root is set here; the leaf is generated:
+  #   results/<experiment>_<timestamp>/
+  #     resolved_config.yaml     the run's config, written once
+  #     run.log
+  #     sigma_0.01/ ... sigma_0.60/
+  # The timestamp is automatic so a re-run cannot destroy the previous one.
+  # Override with --output PATH when a launcher needs a stable name.
+  output_dir: results
+  save_raw: true                  # per-query estimates, not just aggregates, so the
+                                  # figures can be redrawn without re-running
+  formats: [csv, json, png, pdf]
+  wandb: false
+
+seeds:
+  centers_subset: 0
+  query_states: 0
+  probes: 0

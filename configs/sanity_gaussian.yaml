@@ -1,0 +1,76 @@
+# Spec 7.1, run through the production pipeline (phase 11).
+#
+# A mixture with ONE component at the origin is exactly N(0, sigma^2 I), so the
+# marginal field is exactly v = k_t x and w(t) = sigma^2 / c_t^2 in closed form.
+# No special code path -- only this file. That the config can express it at all
+# is the test that the synthetic-target option is real.
+#
+# No data, no GPU, runs in seconds.
+#
+#   python wavg.py --config configs/sanity_gaussian.yaml
+
+experiment: sanity_gaussian
+
+data:
+  source: synthetic
+  synthetic:
+    num_components: 1
+    dim: 256                      # match the real latents so the Monte-Carlo
+                                  # spread, sqrt(2/(d K)), is the same here
+    centers: zeros                # "zeros" puts the single component at the origin
+  apply_sd_scale: false           # nothing was loaded; nothing to rescale
+
+gmm:
+  component_sigma: [0.01, 0.1, 0.3, 0.6]
+  responsibility_log_cutoff: null
+
+time:
+  num_points: 50
+  t_min: 0.0
+  t_max: 0.98
+
+monte_carlo:
+  num_query_states: 4096          # cheap here, so push M up: the closed form is
+                                  # exact and only Monte-Carlo error separates us
+                                  # from it
+  num_probes: 16
+  # Central (Eq. 29) over one-sided (Eq. 27): bias drops from O(eps) to
+  # O(eps^2) because the even Taylor terms cancel, which widens the usable
+  # alpha plateau away from the numerical floor. Costs 2K solves instead of
+  # K+1 -- 1.6x at K=4.
+  scheme: central
+  epsilon_alpha:
+    default: 0.001                # any value works: the flow map is exactly linear
+                                  # here, so the difference quotient has NO
+                                  # truncation error and w is eps-independent
+    by_sigma: {}
+  rho_source: exact
+
+ode:
+  integrator: rk4
+  step_size:
+    default: 0.015625
+    by_sigma:
+      0.01: 0.001953125
+
+compute:
+  device: cpu
+  dtype: float64                  # no reason not to: N=1 makes this free, and it
+                                  # removes precision from the list of suspects if
+                                  # the closed form is ever missed
+  allow_tf32: false
+  chunk_size: auto
+
+distributed:
+  num_gpus: 1
+
+output:
+  output_dir: results             # -> results/sanity_gaussian_<timestamp>/sigma_*/
+  save_raw: true
+  formats: [csv, json, png, pdf]
+  wandb: false
+
+seeds:
+  centers_subset: 0
+  query_states: 0
+  probes: 0

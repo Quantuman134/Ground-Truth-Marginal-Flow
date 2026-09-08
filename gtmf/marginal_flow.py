@@ -13,6 +13,7 @@ import math
 import torch
 
 from . import schedule
+from .rng import check_generator
 
 
 def velocity_naive(mu, sigma, x, t):
@@ -255,7 +256,11 @@ class MarginalFlow:
         This is used ONLY to place query states. It must never be used to carry a
         state to the endpoint -- that is what the marginal ODE is for. See the
         Critical Invariant in CLAUDE.md.
+
+        The draws follow the centres onto their device, so `generator` has to live
+        there too -- see gtmf.rng.
         """
+        check_generator(generator, self.mu.device, "sample_query_states generator")
         kw = {"dtype": self.mu.dtype, "device": self.mu.device}
         i = torch.randint(self.n, (m,), generator=generator, device=self.mu.device)
         eps = torch.randn((m, self.d), generator=generator, **kw)

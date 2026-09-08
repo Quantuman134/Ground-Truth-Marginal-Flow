@@ -400,3 +400,55 @@ def test_a_non_vector_is_rejected(bad):
 def test_an_empty_batch_is_rejected():
     with pytest.raises(ValueError, match="no query states"):
         mean_and_stderr(torch.zeros(0, dtype=torch.float64))
+
+
+# --------------------------------------------------------------------------- #
+# device-matched generators (gtmf.rng)
+#
+# perturbed_batch draws its probes onto x's device. Every test above builds a
+# CPU generator, so the CUDA pairing the production config actually asks for
+# (compute.device: cuda) was never exercised.
+# --------------------------------------------------------------------------- #
+
+from gtmf.rng import make_generator                                 # noqa: E402
+
+NEEDS_GPU = pytest.mark.skipif(not torch.cuda.is_available(),
+                               reason="no GPU on this machine")
+
+
+@NEEDS_GPU
+@pytest.mark.parametrize("scheme", ["one_sided", "central"])
+def test_perturbed_batch_draws_probes_on_cuda(scheme):
+    """The GPU path. This raised RuntimeError before gtmf.rng."""
+    x = torch.randn(8, 5, device="cuda")
+    batch, blocks = perturbed_batch(x, 1e-3, 3, make_generator(0, "cuda"), scheme)
+    assert blocks == (4 if scheme == "one_sided" else 6)
+    assert batch.shape == (blocks * 8, 5) and batch.device.type == "cuda"
+
+
+@NEEDS_GPU
+def test_perturbed_batch_names_the_generator_on_a_device_mismatch():
+    x = torch.randn(8, 5, device="cuda")
+    with pytest.raises(ValueError, match="perturbed_batch generator"):
+        perturbed_batch(x, 1e-3, 3, make_generator(0, "cpu"))
+
+
+@NEEDS_GPU
+def test_w_hat_on_cuda_reproduces_the_closed_form():
+    """Full stack on the GPU against sigma^2/c_t^2 -- the strongest oracle there is.
+
+    fp32 and the production step tiers, so this is the arrangement the real run
+    uses. N=1 at the origin makes p_1 exactly N(0, sigma^2 I), and M=4096 with
+    K=8 puts the Monte-Carlo standard error near sqrt(2/(d K M)) = 6.9e-4, so a
+    2% tolerance is loose enough never to flake and tight enough to catch a wrong
+    field, a wrong scheme or a wrong divisor.
+    """
+    for sigma, h in [(0.1, 1 / 64), (0.6, 1 / 64)]:
+        flow = MarginalFlow(torch.zeros(1, 256, device="cuda"), sigma)
+        g = make_generator(3, "cuda")
+        for t in [0.3, 0.7, 0.98]:
+            x = flow.sample_query_states(t, 4096, generator=g)
+            w = w_hat(flow.velocity, x, t, 1e-3 * flow.rho_t_exact(t), 8, h,
+                      generator=g, scheme="central")
+            mean, _ = mean_and_stderr(w)
+            assert mean == pytest.approx(schedule.w_exact(t, sigma), rel=0.02)

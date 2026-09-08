@@ -10,6 +10,7 @@ import math
 import torch
 
 from .integrate import rk4
+from .rng import check_generator
 
 
 def perturbed_batch(x, eps, num_probes, generator=None, scheme="one_sided"):
@@ -49,6 +50,9 @@ def perturbed_batch(x, eps, num_probes, generator=None, scheme="one_sided"):
         raise ValueError(f"eps must be positive, got {eps}")
     if x.dim() != 2:
         raise ValueError(f"x must be (B, d), got {tuple(x.shape)}")
+    # The probes follow x onto its device, so the generator has to live there
+    # too -- see gtmf.rng.
+    check_generator(generator, x.device, "perturbed_batch generator")
 
     # Follow x: a bare torch.randn would be fp32 on the CPU and would silently
     # downcast an fp64 run, or land the probes on the wrong device.

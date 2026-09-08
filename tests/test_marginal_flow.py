@@ -555,3 +555,63 @@ def test_tf32_flag_is_applied_on_cuda(flag):
     mu = randn(20, 6, seed=69).float().cuda()
     MarginalFlow(mu, 0.3, allow_tf32=flag)
     assert torch.backends.cuda.matmul.allow_tf32 is flag
+
+
+# --------------------------------------------------------------------------- #
+# device-matched generators (gtmf.rng)
+#
+# sample_query_states draws onto the centres' device, so a CPU generator cannot
+# serve a CUDA run -- and configs/wavg_imagenet.yaml asks for device: cuda. These
+# are the tests that exercise that pairing; every other test here is on CPU,
+# which is why the mismatch survived until now.
+# --------------------------------------------------------------------------- #
+
+from gtmf.rng import make_generator                              # noqa: E402
+
+NEEDS_GPU = pytest.mark.skipif(not torch.cuda.is_available(),
+                               reason="no GPU on this machine")
+
+
+def test_sample_query_states_takes_a_cpu_generator_on_cpu():
+    flow = MarginalFlow(randn(32, 6, seed=70), 0.3)
+    x = flow.sample_query_states(0.4, 16, generator=make_generator(0, "cpu"))
+    assert x.shape == (16, 6) and x.device.type == "cpu"
+
+
+@NEEDS_GPU
+def test_sample_query_states_draws_on_cuda_with_a_cuda_generator():
+    """The GPU path, end to end. This raised RuntimeError before gtmf.rng."""
+    flow = MarginalFlow(randn(32, 6, seed=71).float().cuda(), 0.3)
+    x = flow.sample_query_states(0.4, 16, generator=make_generator(0, "cuda"))
+    assert x.shape == (16, 6) and x.device.type == "cuda"
+    assert torch.isfinite(x).all()
+
+
+@NEEDS_GPU
+def test_sample_query_states_is_reproducible_on_cuda():
+    flow = MarginalFlow(randn(32, 6, seed=72).float().cuda(), 0.3)
+    a = flow.sample_query_states(0.4, 16, generator=make_generator(5, "cuda"))
+    b = flow.sample_query_states(0.4, 16, generator=make_generator(5, "cuda"))
+    assert torch.equal(a, b)
+
+
+@NEEDS_GPU
+def test_sample_query_states_names_the_generator_on_a_device_mismatch():
+    """A clear ValueError, not torch's bare RuntimeError from three frames down."""
+    flow = MarginalFlow(randn(32, 6, seed=73).float().cuda(), 0.3)
+    with pytest.raises(ValueError, match="sample_query_states generator"):
+        flow.sample_query_states(0.4, 16, generator=make_generator(0, "cpu"))
+
+
+@NEEDS_GPU
+def test_cuda_query_states_match_the_marginal_they_are_drawn_from():
+    """x_t ~ N(t mu_i, c_t^2 I): check the second moment against its closed form.
+
+    Independent oracle -- E||x_t||^2/d = c_t^2 + t^2 E||mu||^2/d -- so this fails
+    if the CUDA path draws from the wrong distribution rather than merely running.
+    """
+    mu = randn(256, 8, seed=74).float().cuda()
+    flow = MarginalFlow(mu, 0.3)
+    t = 0.4
+    x = flow.sample_query_states(t, 200_000, generator=make_generator(1, "cuda"))
+    assert flow.rho_t(x) == pytest.approx(flow.rho_t_exact(t), rel=0.01)

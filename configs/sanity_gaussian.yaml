@@ -39,22 +39,18 @@ monte_carlo:
   # alpha plateau away from the numerical floor. Costs 2K solves instead of
   # K+1 -- 1.6x at K=4.
   scheme: central
-  epsilon_alpha:
-    default: 0.001                # any value works: the flow map is exactly linear
-                                  # here, so the difference quotient has NO
-                                  # truncation error and w is eps-independent
-    by_sigma: {}
+  # Spec Eq. 36. On this target the flow map is exactly linear, so there is NO
+  # truncation error and w must come out identical at every alpha -- which makes
+  # this sweep the check that the sweep machinery adds no structure of its own.
+  epsilon_alpha: [1.0e-4, 3.0e-4, 1.0e-3, 3.0e-3, 1.0e-2, 3.0e-2]
   rho_source: exact
 
 ode:
   integrator: rk4
-  step_size:
-    default: 0.015625
-    by_sigma:
-      0.01: 0.001953125
+  step_size: 0.001953125          # 1/512 for every sigma -- see wavg_imagenet.yaml
 
 compute:
-  device: cpu
+  device: cuda
   dtype: float64                  # no reason not to: N=1 makes this free, and it
                                   # removes precision from the list of suspects if
                                   # the closed form is ever missed
@@ -62,7 +58,7 @@ compute:
   chunk_size: auto
 
 distributed:
-  num_gpus: 1
+  num_gpus: 2
 
 output:
   output_dir: results             # -> results/sanity_gaussian_<timestamp>/sigma_*/

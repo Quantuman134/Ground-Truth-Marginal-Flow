@@ -34,24 +34,33 @@ time:
                                   # range" there rather than the sampled argmax.
 
 monte_carlo:
-  num_query_states: 512           # M -- PLACEHOLDER, set in phase 8. The corrected
-                                  # budget says compute is not the constraint;
-                                  # Monte-Carlo error is, and it falls as 1/sqrt(M).
-  num_probes: 4                   # K
+  # M and K, set by hand and tuned by hand. Predicted Monte-Carlo error
+  # SE/w_avg = sqrt(2/(d*K*M)) = 4.9e-4 here, against 2.0e-3 at the old
+  # M=512/K=4 -- 4x tighter for 16x the work, which is the sqrt law and not
+  # avoidable. Note the batch the estimator integrates is B = 2*M*K = 65,536
+  # rows under the central scheme, 16x what it was; measured 4.3 s per field
+  # evaluation at full N against 280 ms before.
+  num_query_states: 2048          # M
+  num_probes: 16                  # K
   # Central (Eq. 29) over one-sided (Eq. 27): bias drops from O(eps) to
   # O(eps^2) because the even Taylor terms cancel, which widens the usable
   # alpha plateau away from the numerical floor. Costs 2K solves instead of
   # K+1 -- 1.6x at K=4.
   scheme: central
 
-  # eps = alpha * rho_t. Chosen BY HAND from the sweep's plateau, never
-  # automatically. Left null so a run without a chosen alpha fails loudly.
-  # Measured warning for phase 8: on a curved field the bias explodes between
-  # alpha 0.01 and 0.03 -- the perturbed state crosses into another component's
-  # basin -- so the plateau has a hard upper edge well below the spec's 3e-2.
-  epsilon_alpha:
-    default: null
-    by_sigma: {}
+  # eps = alpha * rho_t. Two shapes, and the shape IS the request:
+  #
+  #   epsilon_alpha: [1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2]   <- SWEEP (spec Eq. 36)
+  #       one experiment per alpha: results/<run>/alpha_<a>/sigma_<s>/
+  #   epsilon_alpha: {default: ..., by_sigma: {...}}         <- a single run
+  #
+  # Left as a null single run so production fails loudly until an alpha has been
+  # chosen. Swap in the list to run the plateau sweep, read it off the plot, then
+  # write the per-sigma values back here BY HAND -- never automatically.
+  # Measured warning: on a curved field the bias explodes between alpha 0.01 and
+  # 0.03 -- the perturbed state crosses into another component's basin -- so the
+  # plateau has a hard upper edge well below the spec's 3e-2.
+  epsilon_alpha: [1.0e-4, 3.0e-4, 1.0e-3, 3.0e-3, 1.0e-2, 3.0e-2]
 
   # rho_t from its closed form rather than measured from the sample: the exact
   # value costs nothing and keeps sampling noise out of the perturbation size.
@@ -59,14 +68,15 @@ monte_carlo:
 
 ode:
   integrator: rk4                 # "rk4" | "euler" (euler is for the order check only)
-  # Two tiers. Only sigma=0.01 needs the fine step; the rest reach 1.3e-6 or
-  # better at 1/64. A single global h is wrong in both directions: 1/512
-  # everywhere costs 3.2x for accuracy already 7 orders past the target at
-  # sigma=0.6, and 1/256 everywhere leaves sigma=0.01 only 17x margin.
-  step_size:
-    default: 0.015625             # 1/64
-    by_sigma:
-      0.01: 0.001953125           # 1/512
+  # ONE GLOBAL h for now: the finest tier, applied to every sigma. The two-tier
+  # scheme (1/512 for sigma=0.01, 1/64 for the rest) is measured and correct,
+  # but it is config surface bought before anything has run end to end, so it is
+  # DEFERRED, not overturned -- see CLAUDE.md. This costs 209,280 velocity
+  # evaluations across the four-sigma sweep against 72,192 for two tiers (2.9x,
+  # ~2 h on 8 GPUs at the measured 280 ms/eval), and compute is not the binding
+  # constraint here -- Monte-Carlo error is. Revisit with the phase-8 halve-h
+  # study, which is the first test of h across the real commitment layer.
+  step_size: 0.001953125          # 1/512, every sigma
 
 compute:
   device: cuda

@@ -64,12 +64,17 @@ def test_every_shipped_sigma_resolves_a_step_size(path):
         assert cfg.for_sigma("ode.step_size", sigma) > 0
 
 
-def test_the_two_step_size_tiers_resolve_as_recorded():
-    """sigma=0.01 gets 1/512; everything else gets 1/64 (CLAUDE.md)."""
+def test_one_global_step_size_resolves_for_every_sigma():
+    """Currently ONE h = 1/512 everywhere, not the two tiers (CLAUDE.md).
+
+    The tiered scheme is deferred rather than overturned, so this test states
+    what the file says today: whichever sigma is asked for, the answer is the
+    fine step. It also exercises the bare-scalar shorthand -- one number written,
+    one number used for every sigma.
+    """
     cfg = Config.load(REPO / "configs/wavg_imagenet.yaml")
-    assert cfg.for_sigma("ode.step_size", 0.01) == pytest.approx(1 / 512)
-    for sigma in (0.1, 0.3, 0.6):
-        assert cfg.for_sigma("ode.step_size", sigma) == pytest.approx(1 / 64)
+    for sigma in cfg["gmm.component_sigma"]:
+        assert cfg.for_sigma("ode.step_size", sigma) == pytest.approx(1 / 512)
 
 
 # --- round trip -------------------------------------------------------------- #

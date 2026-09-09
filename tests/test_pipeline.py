@@ -391,8 +391,8 @@ def test_a_killed_run_resumes_where_it_stopped(tmp_path):
     with (part / "w_avg.csv").open("w", newline="") as fh:
         writer = _csv.DictWriter(fh, fieldnames=CSV_COLUMNS)
         writer.writeheader(); writer.writerows(rows)
-    np.savez(part / "raw.npz", t=np.load(part / "raw.npz")["t"][:2],
-             w=np.load(part / "raw.npz")["w"][:2])
+    kept = np.load(part / "raw.npz")
+    np.savez(part / "raw.npz", **{k: kept[k][:2] for k in kept})
 
     messages = []
     run_sigma(cfg, 0.3, part, log=messages.append)
@@ -435,8 +435,8 @@ def test_the_grid_check_still_guards_when_there_is_no_summary(tmp_path):
 def test_a_raw_file_out_of_step_with_the_csv_refuses(tmp_path):
     out = tmp_path / "s"
     run_sigma(sigma_cfg(tmp_path), 0.3, out, log=lambda *_: None)
-    np.savez(out / "raw.npz", t=np.load(out / "raw.npz")["t"][:3],
-             w=np.load(out / "raw.npz")["w"][:3])
+    kept = np.load(out / "raw.npz")
+    np.savez(out / "raw.npz", **{k: kept[k][:3] for k in kept})
     with pytest.raises(ValueError, match="row for row"):
         run_sigma(sigma_cfg(tmp_path), 0.3, out, log=lambda *_: None)
 
@@ -566,3 +566,61 @@ def test_complete_is_true_only_when_the_grid_is_finished(tmp_path):
     summary = run_sigma(sigma_cfg(tmp_path), 0.3, out, log=lambda *_: None)
     assert summary["complete"] is True and summary["num_timepoints"] == 5
     assert json.loads((out / "summary.json").read_text())["complete"] is True
+
+
+# =========================================================================== #
+# derive -- how a sweep changes a knob
+# =========================================================================== #
+
+from gtmf.config import Config                                 # noqa: E402
+from gtmf.pipeline import ALPHAS, alpha_dir, derive            # noqa: E402
+
+
+def test_derive_applies_the_override(tmp_path):
+    cfg = sigma_cfg(tmp_path)
+    assert derive(cfg, **{"monte_carlo.num_probes": 16})["monte_carlo.num_probes"] == 16
+
+
+def test_derive_replaces_a_mapping_with_a_scalar(tmp_path):
+    """How the alpha sweep sets one alpha for every sigma."""
+    out = derive(sigma_cfg(tmp_path), **{"monte_carlo.epsilon_alpha": 3e-4})
+    assert out.for_sigma("monte_carlo.epsilon_alpha", 0.3) == 3e-4
+
+
+def test_derive_does_not_mutate_the_source(tmp_path):
+    cfg = sigma_cfg(tmp_path)
+    before = yaml.safe_dump(cfg.data)
+    derive(cfg, **{"monte_carlo.num_probes": 99})
+    assert yaml.safe_dump(cfg.data) == before
+
+
+def test_derive_revalidates(tmp_path):
+    """An override must not smuggle past the loader's checks."""
+    cfg = sigma_cfg(tmp_path)
+    with pytest.raises(ConfigError, match="ode.integrator"):
+        derive(cfg, **{"ode.integrator": "midpoint"})
+    with pytest.raises(ConfigError, match="at least 1"):
+        derive(cfg, **{"monte_carlo.num_probes": 0})
+
+
+@pytest.mark.parametrize("dotted", ["montecarlo.num_probes", "nope.deep.key"])
+def test_derive_refuses_to_invent_a_section(tmp_path, dotted):
+    """A typo'd section would sit in the config doing nothing while the real
+    setting kept its old value."""
+    with pytest.raises(ConfigError, match="no section"):
+        derive(sigma_cfg(tmp_path), **{dotted: 1})
+
+
+def test_derive_can_set_a_leaf_that_did_not_exist(tmp_path):
+    assert derive(sigma_cfg(tmp_path), **{"compute.allow_tf32": True})[
+        "compute.allow_tf32"] is True
+
+
+def test_the_spec_alpha_list_is_equation_36():
+    assert ALPHAS == (1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2)
+
+
+def test_alpha_directories_sort_and_do_not_collide():
+    names = [alpha_dir(Path("s"), a).name for a in ALPHAS]
+    assert len(set(names)) == len(ALPHAS)
+    assert names[0] == "alpha_0.0001"

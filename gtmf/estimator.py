@@ -13,13 +13,17 @@ from .integrate import rk4
 from .rng import check_generator
 
 
-def perturbed_batch(x, eps, num_probes, generator=None, scheme="one_sided"):
+def perturbed_batch(x, eps, num_probes, generator=None, scheme="one_sided",
+                    probes=None):
     """Stack the states whose endpoints the estimator needs into ONE tensor.
 
         x           (B, d)  query states
         eps         float   perturbation size, alpha * rho_t
         num_probes  int     K, random directions per query
         scheme      "one_sided" (Eq. 27) or "central" (Eq. 29)
+        probes      (K, B, d) directions to use instead of drawing them. Phase 9
+                    passes a slice of the FULL sample so a sharded run uses the
+                    same directions a single process would have drawn.
 
     Returns (batch, num_blocks) where batch is (num_blocks * B, d), laid out in
     contiguous blocks of B rows so the caller can recover it with
@@ -54,10 +58,16 @@ def perturbed_batch(x, eps, num_probes, generator=None, scheme="one_sided"):
     # too -- see gtmf.rng.
     check_generator(generator, x.device, "perturbed_batch generator")
 
-    # Follow x: a bare torch.randn would be fp32 on the CPU and would silently
-    # downcast an fp64 run, or land the probes on the wrong device.
-    u = torch.randn((num_probes, *x.shape), generator=generator,
-                    dtype=x.dtype, device=x.device)
+    if probes is None:
+        # Follow x: a bare torch.randn would be fp32 on the CPU and would
+        # silently downcast an fp64 run, or land the probes on the wrong device.
+        u = torch.randn((num_probes, *x.shape), generator=generator,
+                        dtype=x.dtype, device=x.device)
+    else:
+        if tuple(probes.shape) != (num_probes, *x.shape):
+            raise ValueError(f"probes must be {(num_probes, *x.shape)}, "
+                             f"got {tuple(probes.shape)}")
+        u = probes
 
     if scheme == "one_sided":
         blocks = torch.cat([x.unsqueeze(0), x + eps * u])          # (1 + K, B, d)
@@ -69,7 +79,7 @@ def perturbed_batch(x, eps, num_probes, generator=None, scheme="one_sided"):
 
 
 def w_hat(field, x, t, eps, num_probes, h, generator=None,
-          scheme="one_sided", integrator=rk4):
+          scheme="one_sided", integrator=rk4, probes=None, per_probe=False):
     """Per-query amplification w(x_t, t), one value per row of x.   Eq. 27
 
         field       (x, t) -> v, the marginal velocity
@@ -97,12 +107,19 @@ def w_hat(field, x, t, eps, num_probes, h, generator=None,
         one_sided   ( F(x + eps u) - F(x)         ) / eps      Eq. 27, K+1 solves
         central     ( F(x + eps u) - F(x - eps u) ) / (2 eps)  Eq. 29, 2K solves
 
+    `per_probe` additionally returns the (B, K) values before the average over
+    directions. Averaging over K only reduces the spread WITHIN a query state;
+    the spread of w across different query states is untouched by K and needs M.
+    Keeping both apart is the only way to measure that split, and it is what
+    sets M and K against a target error rather than against a guess.
+
     One-sided leaves an O(eps) truncation bias; central cancels it and leaves
     O(eps^2), for roughly double the integration cost. Neither difference shows up
     on a linear field, where both are exact -- which is what makes the linear case
     a clean test of the arithmetic and a useless test of the schemes.
     """
-    batch, n_blocks = perturbed_batch(x, eps, num_probes, generator, scheme)
+    batch, n_blocks = perturbed_batch(x, eps, num_probes, generator, scheme,
+                                      probes=probes)
     ends = integrator(field, batch, t, 1.0, h).reshape(n_blocks, *x.shape)
 
     if scheme == "one_sided":
@@ -114,7 +131,14 @@ def w_hat(field, x, t, eps, num_probes, h, generator=None,
         # gap between them spans twice the perturbation.
         gaps = (ends[:num_probes] - ends[num_probes:]) / (2.0 * eps)
 
-    return gaps.pow(2).sum(dim=-1).mean(dim=0) / x.shape[1]
+    squared = gaps.pow(2).sum(dim=-1)                        # (K, B)
+    # Left exactly as it was -- mean over K first, then divide by d. Reordering
+    # those two would change the last bits and quietly break reproducibility
+    # against every result already on disk.
+    w = squared.mean(dim=0) / x.shape[1]
+    if per_probe:
+        return w, (squared / x.shape[1]).T                   # (B, K), query-major
+    return w
 
 
 def mean_and_stderr(w):

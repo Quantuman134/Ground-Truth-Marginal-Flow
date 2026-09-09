@@ -51,14 +51,21 @@ def test_a_single_component_at_the_origin_is_the_single_gaussian(tmp_path, sigma
     assert torch.allclose(flow.velocity(x, t), schedule.k_t(t, sigma) * x)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(),
+                    reason="shipped sanity config asks for a GPU")
 def test_the_shipped_sanity_config_builds_the_closed_form_field():
-    """Not a hand-made config -- the actual file phase 11 will run."""
+    """Not a hand-made config -- the actual file phase 11 will run.
+
+    The probe follows the FLOW's device rather than assuming CPU: this file's
+    compute.device is a setting the user changes, and a test that hard-coded
+    the answer would fail on an edit that is perfectly valid.
+    """
     cfg = Config.load(REPO / "configs/sanity_gaussian.yaml")
     for sigma in cfg["gmm.component_sigma"]:
         flow = build_target(cfg, sigma)
         assert flow.n == 1 and flow.d == 256
         x = torch.randn((3, 256), generator=torch.Generator().manual_seed(1),
-                        dtype=torch.float64)
+                        dtype=torch.float64).to(flow.mu.device)
         assert torch.allclose(flow.velocity(x, 0.5), schedule.k_t(0.5, sigma) * x)
 
 

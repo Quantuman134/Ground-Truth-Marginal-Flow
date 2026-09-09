@@ -94,6 +94,11 @@ class Config:
         a run without a hand-chosen value stops instead of guessing.
         """
         node = self.get(dotted)
+        if isinstance(node, list):
+            raise ConfigError(
+                f"{self._where()}: '{dotted}' is a list, which means a SWEEP -- "
+                f"one experiment per entry. It has no single value for "
+                f"sigma={sigma}; derive a config per entry first.")
         if not isinstance(node, dict):
             # Shorthand: a bare scalar means the same value for every sigma. No
             # ambiguity in that -- one number was written, one number is used.
@@ -148,6 +153,17 @@ class Config:
         for key in ("monte_carlo.num_query_states", "monte_carlo.num_probes"):
             if self.get(key) < 1:
                 raise ConfigError(f"{self._where()}: '{key}' must be at least 1")
+        # epsilon_alpha takes two shapes and the shape is the request: a list
+        # sweeps (one experiment per entry, like gmm.component_sigma), anything
+        # else is a single run. Only the list needs checking here.
+        alphas = self.get("monte_carlo.epsilon_alpha", default=None)
+        if isinstance(alphas, list):
+            if not alphas:
+                raise ConfigError(f"{self._where()}: 'monte_carlo.epsilon_alpha' "
+                                  f"is an empty list; give at least one alpha")
+            if any(a is None or a <= 0 for a in alphas):
+                raise ConfigError(f"{self._where()}: alphas must be positive, "
+                                  f"got {alphas}")
         if self.get("monte_carlo.scheme") not in ("one_sided", "central"):
             raise ConfigError(f"{self._where()}: monte_carlo.scheme must be "
                               f"'one_sided' or 'central'")

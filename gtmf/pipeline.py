@@ -17,6 +17,7 @@ velocity field `4S` times for RK4, and the interpolant shortcut would call it
 zero times while still returning numbers.
 """
 
+import copy
 import csv
 import json
 import math
@@ -29,6 +30,8 @@ import numpy as np
 import torch
 
 from . import schedule
+from . import dist
+from .config import Config, ConfigError
 from .estimator import mean_and_stderr, w_hat
 from .integrate import euler, rk4
 from .rng import make_generator
@@ -46,12 +49,19 @@ class TimepointResult:
     re-running (CLAUDE.md, "Raw data"), and it is moved to the CPU so step 4 can
     write it straight out and so a long sweep does not pin M floats per timepoint
     on the GPU.
+
+    `w_per_probe` is the same estimate before averaging over the K directions.
+    It costs K times as much -- 6.25 MB per sigma at production size against
+    0.39 MB -- and it is the only thing that separates the variance WITHIN a
+    query state (which K reduces) from the variance ACROSS query states (which
+    only M reduces). Without it, choosing M and K is guesswork.
     """
 
     t: float
     w_avg: float
     stderr: float
     w_per_query: torch.Tensor       # (M,) on the CPU
+    w_per_probe: torch.Tensor       # (M, K) on the CPU, before the K average
     rho_t: float
     eps: float
     seconds: float
@@ -69,7 +79,8 @@ def _sync(device):
         torch.cuda.synchronize(device)
 
 
-def run_timepoint(flow, cfg, sigma, t, generator=None, probe_generator=None):
+def run_timepoint(flow, cfg, sigma, t, generator=None, probe_generator=None,
+                  shard=True):
     """Estimate w_avg at one time t.   Returns a :class:`TimepointResult`.
 
         flow       MarginalFlow for this sigma (from build_target)
@@ -77,6 +88,11 @@ def run_timepoint(flow, cfg, sigma, t, generator=None, probe_generator=None):
         sigma      the swept sigma; selects alpha and h from their by_sigma maps
         t          the time to inject the perturbation at
         generator  seeded, and on the same device as the centres (see gtmf.rng)
+        shard      split the M query states across ranks (default). Every rank
+                   draws the SAME full sample and keeps a contiguous slice, so
+                   the union is exactly what one process would have drawn and
+                   the gathered result is identical at any world size. Pass
+                   False to force a whole-sample run on this rank.
         probe_generator  optional second stream for the probe directions;
                    defaults to `generator`. Kept separate because the estimator
                    needs u independent of x_t -- E[u u^T] = I is what turns the
@@ -111,25 +127,44 @@ def run_timepoint(flow, cfg, sigma, t, generator=None, probe_generator=None):
     started = time.perf_counter()
 
     # Sampling only. This state is the START of a trajectory, never the end.
-    x_t = flow.sample_query_states(t, m, generator=generator)
+    # The FULL sample is drawn on every rank; the split happens after, so the
+    # draws never depend on how many ranks there are.
+    x_full = flow.sample_query_states(t, m, generator=generator)
+
+    # Drawn here rather than inside perturbed_batch for the same reason: same
+    # generator, same (K, M, d) shape, same order, so the single-process numbers
+    # are unchanged -- and a shard can be taken from the full set.
+    u_full = torch.randn(
+        (k, m, flow.d),
+        generator=generator if probe_generator is None else probe_generator,
+        dtype=x_full.dtype, device=x_full.device)
 
     # "exact" is the default: the closed form costs nothing and keeps sampling
     # noise out of the perturbation size, so eps depends on t alone and not on
-    # which M states happened to be drawn.
-    rho_t = flow.rho_t_exact(t) if rho_source == "exact" else flow.rho_t(x_t)
+    # which M states happened to be drawn. Measured from the FULL sample either
+    # way, so eps does not depend on how the work was divided.
+    rho_t = flow.rho_t_exact(t) if rho_source == "exact" else flow.rho_t(x_full)
     eps = alpha * rho_t
 
-    # The ONLY route to t = 1: the marginal field, integrated.
-    w = w_hat(flow.velocity, x_t, t, eps, k, h,
-              generator=generator if probe_generator is None else probe_generator,
-              scheme=scheme, integrator=INTEGRATORS[name])
+    lo, hi = dist.shard_bounds(m) if shard else (0, m)
+    x_t, u = x_full[lo:hi], u_full[:, lo:hi]
 
+    # The ONLY route to t = 1: the marginal field, integrated.
+    w_local, probe_local = w_hat(flow.velocity, x_t, t, eps, k, h,
+                                 scheme=scheme, integrator=INTEGRATORS[name],
+                                 probes=u, per_probe=True)
+
+    # Back to the full per-query vectors, in the original order, on every rank,
+    # so mean_and_stderr sees exactly what a single process would have.
+    w = dist.gather_rows(w_local) if shard else w_local
+    per_probe = dist.gather_rows(probe_local) if shard else probe_local
     w_avg, stderr = mean_and_stderr(w)
     _sync(device)
     seconds = time.perf_counter() - started
 
     return TimepointResult(t=float(t), w_avg=w_avg, stderr=stderr,
                            w_per_query=w.detach().to("cpu"),
+                           w_per_probe=per_probe.detach().to("cpu"),
                            rho_t=float(rho_t), eps=float(eps), seconds=seconds)
 
 
@@ -179,6 +214,62 @@ def _stream(base_seed, stream, index, device):
     return make_generator(int(entropy), device)
 
 
+def derive(cfg, **overrides):
+    """A copy of `cfg` with dotted overrides applied, re-validated.
+
+        derive(cfg, **{"monte_carlo.epsilon_alpha": 3e-4})
+
+    How a sweep changes a knob. Routing every study through here means a sweep
+    point is an ordinary run -- same code, same settings record -- rather than a
+    special path, and an override cannot smuggle in a setting the loader would
+    have rejected.
+
+    A missing SECTION raises rather than being created: a typo like
+    `montecarlo.num_probes` would otherwise sit in the config doing nothing while
+    the real setting kept its old value. A missing leaf is fine.
+    """
+    data = copy.deepcopy(cfg.data)
+    for dotted, value in overrides.items():
+        node = data
+        *parents, leaf = dotted.split(".")
+        for i, part in enumerate(parents):
+            if not isinstance(node, dict) or part not in node:
+                raise ConfigError(f"cannot override '{dotted}': no section "
+                                  f"'{'.'.join(parents[:i + 1])}' in this config")
+            node = node[part]
+        if not isinstance(node, dict):
+            raise ConfigError(f"cannot override '{dotted}': "
+                              f"'{'.'.join(parents)}' is not a section")
+        node[leaf] = value
+    return Config(data, source=cfg.source).validate()
+
+
+# Spec Eq. 36 -- the alpha sweep of section 7.2.
+ALPHAS = (1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2)
+
+
+def alpha_dir(run_dir, alpha):
+    """One directory per swept alpha, each holding a full sigma sweep."""
+    return Path(run_dir) / f"alpha_{float(alpha):g}"
+
+
+def swept_alphas(cfg):
+    """The alphas to sweep, or None for a single run.
+
+    `monte_carlo.epsilon_alpha` takes two shapes, and the shape IS the request:
+
+        [1e-4, 3e-4, 1e-3]      a sweep -- one experiment per alpha
+        {default:, by_sigma:}   a single run, resolved per sigma
+        3e-3                    the same, one value for every sigma
+
+    The list form mirrors `gmm.component_sigma`; the mapping form is what a
+    production config uses once the alphas have been chosen by hand, since
+    CLAUDE.md wants a different alpha per sigma there.
+    """
+    node = cfg.get("monte_carlo.epsilon_alpha", default=None)
+    return [float(a) for a in node] if isinstance(node, list) else None
+
+
 def settings_for(cfg, sigma):
     """Everything that determines the numbers for ONE sigma, already resolved.
 
@@ -225,7 +316,7 @@ def _hms(seconds):
 
 
 def _read_done(out_dir, grid, settings=None):
-    """Rows already on disk, for resuming. Returns (rows, per_query list).
+    """Rows already on disk, for resuming. Returns (rows, per_query, per_probe).
 
     A resumed run must be the SAME experiment. Two things are checked:
 
@@ -242,7 +333,7 @@ def _read_done(out_dir, grid, settings=None):
     """
     csv_path, raw_path = out_dir / CSV_NAME, out_dir / RAW_NAME
     if not csv_path.exists():
-        return [], []
+        return [], [], []
 
     summary_path = out_dir / SUMMARY_NAME
     if settings is not None and summary_path.exists():
@@ -257,7 +348,7 @@ def _read_done(out_dir, grid, settings=None):
     with csv_path.open() as fh:
         rows = [{k: float(v) for k, v in row.items()} for row in csv.DictReader(fh)]
     if not rows:
-        return [], []
+        return [], [], []
 
     if len(rows) > len(grid):
         raise ValueError(f"{csv_path} holds {len(rows)} rows but the grid has "
@@ -268,14 +359,21 @@ def _read_done(out_dir, grid, settings=None):
                              f"puts t={grid[i]} there; refusing to resume a "
                              f"different time grid")
 
-    raw = np.load(raw_path) if raw_path.exists() else None
-    if raw is None or len(raw["w"]) != len(rows):
+    if not raw_path.exists():
+        raise ValueError(f"{csv_path} has rows but {raw_path} is missing; "
+                         f"delete the directory to start this sigma over")
+    stored = np.load(raw_path)
+    if "w_probe" not in stored:
+        raise ValueError(f"{raw_path} predates per-probe raw data and cannot be "
+                         f"resumed into; delete the directory to recompute it")
+    raw, probe = list(stored["w"]), list(stored["w_probe"])
+    if not len(raw) == len(probe) == len(rows):
         raise ValueError(f"{raw_path} does not match {csv_path} row for row; "
                          f"delete the directory to start this sigma over")
-    return rows, [w for w in raw["w"]]
+    return rows, raw, probe
 
 
-def _write_progress(out_dir, rows, per_query):
+def _write_progress(out_dir, rows, per_query, per_probe):
     """Rewrite both output files. Called after every timepoint, so a killed run
     resumes from the last completed t rather than restarting the sigma.
 
@@ -289,7 +387,10 @@ def _write_progress(out_dir, rows, per_query):
         writer.writerows(rows)
     np.savez(out_dir / RAW_NAME,
              t=np.array([r["t"] for r in rows], dtype=np.float64),
-             w=np.stack(per_query) if per_query else np.zeros((0, 0)))
+             w=np.stack(per_query) if per_query else np.zeros((0, 0)),
+             # (num_points, M, K) -- ~6 MB per sigma at production size, and the
+             # only record of how much of the spread K can actually remove.
+             w_probe=np.stack(per_probe) if per_probe else np.zeros((0, 0, 0)))
 
 
 def _peak(cfg, sigma, rows):
@@ -337,7 +438,8 @@ def _write_summary(out_dir, cfg, sigma, flow, rows, settings, seconds, complete)
                    "mean_seconds_per_timepoint":
                        sum(r["seconds"] for r in rows) / len(rows)},
     }
-    (out_dir / SUMMARY_NAME).write_text(json.dumps(summary, indent=2) + "\n")
+    if dist.is_main():
+        (out_dir / SUMMARY_NAME).write_text(json.dumps(summary, indent=2) + "\n")
     return summary
 
 
@@ -355,13 +457,16 @@ def run_sigma(cfg, sigma, out_dir, flow=None, log=print):
     Returns the summary dict.
     """
     out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if dist.is_main():
+        out_dir.mkdir(parents=True, exist_ok=True)
+    dist.barrier()                       # nobody reads before rank 0 has created it
+    log = log if dist.is_main() else (lambda *_: None)
     grid = measurement_times(cfg)
 
     # Resolved from the config alone, so a settings mismatch stops the run before
     # build_target reads 1.3 GB of centres.
     settings = settings_for(cfg, sigma)
-    rows, per_query = _read_done(out_dir, grid, settings)
+    rows, per_query, per_probe = _read_done(out_dir, grid, settings)
     start = len(rows)                       # first index THIS invocation computes
     if start:
         log(f"  resuming at t index {start} of {len(grid)} ({start} already done)")
@@ -382,8 +487,9 @@ def run_sigma(cfg, sigma, out_dir, flow=None, log=print):
 
         row = asdict(result)
         per_query.append(row.pop("w_per_query").numpy())
+        per_probe.append(row.pop("w_per_probe").numpy())
         rows.append(row)
-        _write_progress(out_dir, rows, per_query)
+        _write_progress(out_dir, rows, per_query, per_probe)
         # After every timepoint, not just at the end: this is the file a resumed
         # run reads its settings back from, and a killed run leaves one that says
         # how far it got.
@@ -422,18 +528,22 @@ class RunLog:
     few lines -- the ones that say where a run had got to when it died.
     """
 
-    def __init__(self, path, echo=True):
-        self.handle = Path(path).open("a", buffering=1)      # line buffered
+    def __init__(self, path, echo=True, write=True):
+        # Rank 0 alone opens the file: eight ranks appending the same lines would
+        # interleave them into an unreadable log.
+        self.handle = Path(path).open("a", buffering=1) if write else None
         self.echo = echo
 
     def __call__(self, message=""):
         if self.echo:
             print(message, flush=True)
-        self.handle.write(message + "\n")
-        self.handle.flush()
+        if self.handle is not None:
+            self.handle.write(message + "\n")
+            self.handle.flush()
 
     def close(self):
-        self.handle.close()
+        if self.handle is not None:
+            self.handle.close()
 
     def __enter__(self):
         return self
@@ -467,6 +577,20 @@ def prepare_run_dir(run_dir, force=False):
     return run_dir
 
 
+def _finished_summary(dest):
+    """The summary of an already-complete run at `dest`, or None.
+
+    Checked before the target is built, so a resumed sweep with nothing left to
+    do does not read 1.3 GB of centres to discover that. A PARTIAL run returns
+    None on purpose -- run_sigma resumes those.
+    """
+    path = Path(dest) / SUMMARY_NAME
+    if not path.exists():
+        return None
+    summary = json.loads(path.read_text())
+    return summary if summary.get("complete") else None
+
+
 def run_sweep(cfg, run_dir=None, force=False, echo=True):
     """Walk every sigma in `gmm.component_sigma`, one subdirectory each.
 
@@ -481,12 +605,22 @@ def run_sweep(cfg, run_dir=None, force=False, echo=True):
 
     Returns a dict with the run directory and one summary per sigma.
     """
-    run_dir = prepare_run_dir(cfg.run_dir() if run_dir is None else run_dir, force)
-    cfg.dump(run_dir / RESOLVED_NAME)
+    run_dir = Path(cfg.run_dir() if run_dir is None else run_dir)
+    if dist.is_main():
+        prepare_run_dir(run_dir, force)
+        cfg.dump(run_dir / RESOLVED_NAME)
+    dist.barrier()
     sigmas = list(cfg["gmm.component_sigma"])
+    alphas = swept_alphas(cfg)
+    # Alpha is the outer level, in the directories AND in the running order: one
+    # alpha's full sigma sweep finishes before the next begins, so a run killed
+    # part way leaves complete experiments rather than every alpha half done.
+    plan = [(None, run_dir)] if alphas is None else \
+        [(a, alpha_dir(run_dir, a)) for a in alphas]
     started = time.perf_counter()
 
-    with RunLog(run_dir / LOG_NAME, echo=echo) as log:
+    with RunLog(run_dir / LOG_NAME, echo=echo and dist.is_main(),
+                write=dist.is_main()) as log:
         rule = "=" * 70
         log(rule)
         log(" GTMF -- reference w_avg(t)")
@@ -494,27 +628,53 @@ def run_sweep(cfg, run_dir=None, force=False, echo=True):
         log(f" config     : {cfg.source if cfg.source else '<in memory>'}")
         log(f" run dir    : {run_dir}")
         log(f" sigmas     : {sigmas}")
+        log(f" ranks      : {dist.world_size()}")
+        log(f" alphas     : {alphas if alphas else '(single run, from the config)'}")
         log(f" started    : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         log(rule)
 
         summaries = {}
-        for sigma in sigmas:
-            out_dir = cfg.sigma_dir(run_dir, sigma)
-            log("")
-            log(f"sigma = {sigma}  ->  {out_dir.name}/   "
-                f"h={cfg.for_sigma('ode.step_size', sigma)}  "
-                f"alpha={cfg.for_sigma('monte_carlo.epsilon_alpha', sigma)}  "
-                f"M={cfg['monte_carlo.num_query_states']}  "
-                f"K={cfg['monte_carlo.num_probes']}")
-            at = time.perf_counter()
-            summaries[str(sigma)] = run_sigma(cfg, sigma, out_dir, log=log)
-            log(f"  sigma {sigma} done in {_hms(time.perf_counter() - at)}")
+        # Targets are cached across the whole sweep, because alpha is now the
+        # outer loop: without this, each sigma's centres would be re-read once
+        # per alpha -- 24 loads of 1.3 GB for a 6-alpha, 4-sigma sweep instead of
+        # 4. The centres are the same array for every sigma, so what is really
+        # bought is one load; holding all four flows costs ~5.3 GB at full N,
+        # which is nothing against 140 GB.
+        flows = {}
+        for alpha, base in plan:
+            for sigma in sigmas:
+                dest = cfg.sigma_dir(base, sigma)
+                key = str(sigma) if alpha is None else f"{sigma}/{alpha:g}"
+                finished = _finished_summary(dest)
+                if finished is not None:
+                    summaries[key] = finished
+                    log("")
+                    log(f"sigma = {sigma}  ->  {dest.relative_to(run_dir)}/   "
+                        f"already complete, skipping")
+                    continue
+                derived = cfg if alpha is None else derive(
+                    cfg, **{"monte_carlo.epsilon_alpha": float(alpha)})
+                log("")
+                log(f"sigma = {sigma}  ->  {dest.relative_to(run_dir)}/   "
+                    f"h={derived.for_sigma('ode.step_size', sigma)}  "
+                    f"alpha={derived.for_sigma('monte_carlo.epsilon_alpha', sigma)}  "
+                    f"M={derived['monte_carlo.num_query_states']}  "
+                    f"K={derived['monte_carlo.num_probes']}")
+                at = time.perf_counter()
+                if sigma not in flows:
+                    flows[sigma] = build_target(cfg, sigma)
+                summaries[key] = run_sigma(derived, sigma, dest,
+                                           flow=flows[sigma], log=log)
+                log(f"  {key} done in {_hms(time.perf_counter() - at)}")
 
         total = time.perf_counter() - started
         log("")
         log(rule)
-        log(f" all {len(sigmas)} sigma(s) done in {_hms(total)}  ->  {run_dir}")
+        what = (f"{len(sigmas)} sigma(s)" if alphas is None else
+                f"{len(alphas) * len(sigmas)} run(s) "
+                f"({len(alphas)} alphas x {len(sigmas)} sigmas)")
+        log(f" all {what} done in {_hms(total)}  ->  {run_dir}")
         log(rule)
 
-    return {"run_dir": run_dir, "sigmas": sigmas, "summaries": summaries,
-            "seconds": total}
+    return {"run_dir": run_dir, "sigmas": sigmas, "alphas": alphas,
+            "summaries": summaries, "seconds": total}
